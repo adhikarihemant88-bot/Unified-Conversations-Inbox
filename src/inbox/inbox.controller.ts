@@ -8,12 +8,11 @@ import {
   Patch,
   Post,
   Query,
-  Req,
   Res,
   UseGuards,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { AgentGuard, type AgentRequest } from './auth';
+import { BearerAuthGuard, UseBearerToken } from '../common/bearer-auth';
 import { InboxService } from './inbox.service';
 import { EventsService } from './events.service';
 import { SendMessageDto } from './dto/send-message.dto';
@@ -28,27 +27,29 @@ import {
   LocationParamsDto,
 } from './dto/route-params.dto';
 @Controller()
-@UseGuards(AgentGuard)
+@UseBearerToken('INBOX_TOKEN')
+@UseGuards(BearerAuthGuard)
 export class InboxController {
   constructor(
     private readonly inbox: InboxService,
     private readonly events: EventsService,
   ) {}
   @Get('locations/:locationId/conversations')
-  conversations(
+  async conversations(
     @Param() params: LocationParamsDto,
     @Query() query: ConversationQueryDto,
   ) {
-    return this.inbox.listConversations(params.locationId, query);
+    const { items, nextCursor, hasMore } =
+      await this.inbox.listConversations(params.locationId, query);
+    return { message: 'Success', data: items, nextCursor, hasMore };
   }
 
   @Get('conversations/:id/messages')
   messages(
-    @Req() req: AgentRequest,
     @Param() params: ConversationParamsDto,
     @Query() query: PaginationDto,
   ) {
-    return this.inbox.listMessages(req.agent.location_id, params.id, query);
+    return this.inbox.listMessages(params.id, query);
   }
 
   @Get('locations/:locationId/messages/search')
@@ -61,35 +62,31 @@ export class InboxController {
 
   @Post('conversations/:id/messages')
   @HttpCode(202)
-  send(
-    @Req() req: AgentRequest,
-    @Param() params: ConversationParamsDto,
-    @Body() body: SendMessageDto,
-  ) {
-    return this.inbox.send(req.agent.location_id, params.id, body);
+  send(@Param() params: ConversationParamsDto, @Body() body: SendMessageDto) {
+    return this.inbox.send(params.id, body);
   }
 
   @Post('conversations/:id/read')
   @HttpCode(200)
-  read(@Req() req: AgentRequest, @Param() params: ConversationParamsDto) {
-    return this.inbox.read(req.agent.location_id, params.id);
+  read(@Param() params: ConversationParamsDto) {
+    return this.inbox.read(params.id);
   }
 
   @Patch('conversations/:id')
   patch(
-    @Req() req: AgentRequest,
     @Param() params: ConversationParamsDto,
     @Body() body: UpdateConversationDto,
   ) {
-    return this.inbox.patch(req.agent.location_id, params.id, body);
+    return this.inbox.patch(params.id, body);
   }
 
   @Get('locations/:locationId/events')
-  eventsStream(
+  async eventsStream(
     @Param() params: LocationParamsDto,
     @Headers('last-event-id') last: unknown,
     @Res() res: Response,
   ) {
-    return this.events.open(params.locationId, last, res);
+    const locationId = await this.inbox.resolveLocationId(params.locationId);
+    return this.events.open(locationId, last, res);
   }
 }

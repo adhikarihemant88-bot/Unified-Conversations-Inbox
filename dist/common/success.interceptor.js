@@ -27,10 +27,19 @@ let SuccessInterceptor = class SuccessInterceptor {
                 'data' in data
                 ? data
                 : undefined;
+            const pagination = result &&
+                'nextCursor' in result &&
+                'hasMore' in result
+                ? {
+                    nextCursor: result.nextCursor,
+                    hasMore: result.hasMore,
+                }
+                : {};
             return {
                 status: response.statusCode,
                 message: result?.message ?? 'Success',
                 data: result ? result.data : (data ?? null),
+                ...pagination,
             };
         }));
     }

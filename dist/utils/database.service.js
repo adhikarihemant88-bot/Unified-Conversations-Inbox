@@ -11,38 +11,56 @@ var __metadata = (this && this.__metadata) || function (k, v) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.DatabaseService = void 0;
 const common_1 = require("@nestjs/common");
-const pg_1 = require("pg");
+const typeorm_1 = require("typeorm");
+const agent_assignment_lock_entity_1 = require("../entities/agent-assignment-lock.entity");
+const agent_entity_1 = require("../entities/agent.entity");
+const contact_entity_1 = require("../entities/contact.entity");
+const contact_identity_entity_1 = require("../entities/contact-identity.entity");
+const conversation_entity_1 = require("../entities/conversation.entity");
+const inbox_event_entity_1 = require("../entities/inbox-event.entity");
+const location_entity_1 = require("../entities/location.entity");
+const message_entity_1 = require("../entities/message.entity");
+const pagination_snapshot_entity_1 = require("../entities/pagination-snapshot.entity");
+const provider_state_entity_1 = require("../entities/provider-state.entity");
+const send_job_entity_1 = require("../entities/send-job.entity");
 const database_url_1 = require("./database-url");
 let DatabaseService = class DatabaseService {
-    pool;
+    source;
     constructor() {
-        const connectionString = (0, database_url_1.databaseUrl)(process.env.DATABASE_URL);
-        this.pool = new pg_1.Pool({
-            connectionString,
+        this.source = new typeorm_1.DataSource({
+            type: 'postgres',
+            url: (0, database_url_1.databaseUrl)(process.env.DATABASE_URL),
+            entities: [
+                agent_entity_1.Agent,
+                agent_assignment_lock_entity_1.AgentAssignmentLock,
+                contact_entity_1.Contact,
+                contact_identity_entity_1.ContactIdentity,
+                conversation_entity_1.Conversation,
+                inbox_event_entity_1.InboxEvent,
+                location_entity_1.Location,
+                message_entity_1.Message,
+                pagination_snapshot_entity_1.PaginationSnapshot,
+                provider_state_entity_1.ProviderState,
+                send_job_entity_1.SendJob,
+            ],
+            synchronize: false,
+            installExtensions: false,
         });
     }
-    async query(sql, params = []) {
-        const result = await this.pool.query(sql, params);
-        return result.rows;
+    async onModuleInit() {
+        await this.source.initialize();
     }
-    async transaction(work) {
-        const client = await this.pool.connect();
-        try {
-            await client.query('BEGIN');
-            const result = await work(client);
-            await client.query('COMMIT');
-            return result;
-        }
-        catch (error) {
-            await client.query('ROLLBACK');
-            throw error;
-        }
-        finally {
-            client.release();
-        }
+    ormTransaction(work, isolationLevel) {
+        return isolationLevel
+            ? this.source.transaction(isolationLevel, work)
+            : this.source.transaction(work);
+    }
+    getRepository(target) {
+        return this.source.getRepository(target);
     }
     async onModuleDestroy() {
-        await this.pool.end();
+        if (this.source.isInitialized)
+            await this.source.destroy();
     }
 };
 exports.DatabaseService = DatabaseService;

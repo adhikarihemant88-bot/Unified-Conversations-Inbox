@@ -1,42 +1,73 @@
-import { Injectable, OnModuleDestroy } from '@nestjs/common';
-import { Pool, type PoolClient } from 'pg';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  DataSource,
+  type EntityManager,
+  type EntityTarget,
+  type ObjectLiteral,
+  type Repository,
+} from 'typeorm';
+import { AgentAssignmentLock } from '../entities/agent-assignment-lock.entity';
+import { Agent } from '../entities/agent.entity';
+import { Contact } from '../entities/contact.entity';
+import { ContactIdentity } from '../entities/contact-identity.entity';
+import { Conversation } from '../entities/conversation.entity';
+import { InboxEvent } from '../entities/inbox-event.entity';
+import { Location } from '../entities/location.entity';
+import { Message } from '../entities/message.entity';
+import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
+import { ProviderState } from '../entities/provider-state.entity';
+import { SendJob } from '../entities/send-job.entity';
 import { databaseUrl } from './database-url';
 
+type TransactionIsolationLevel =
+  'READ UNCOMMITTED' | 'READ COMMITTED' | 'REPEATABLE READ' | 'SERIALIZABLE';
+
 @Injectable()
-export class DatabaseService implements OnModuleDestroy {
-  private readonly pool: Pool;
+export class DatabaseService implements OnModuleInit, OnModuleDestroy {
+  private readonly source: DataSource;
 
   constructor() {
-    const connectionString = databaseUrl(process.env.DATABASE_URL);
-    this.pool = new Pool({
-      connectionString,
+    this.source = new DataSource({
+      type: 'postgres',
+      url: databaseUrl(process.env.DATABASE_URL),
+      entities: [
+        Agent,
+        AgentAssignmentLock,
+        Contact,
+        ContactIdentity,
+        Conversation,
+        InboxEvent,
+        Location,
+        Message,
+        PaginationSnapshot,
+        ProviderState,
+        SendJob,
+      ],
+      synchronize: false,
+      installExtensions: false,
     });
   }
 
-  async query<T extends object>(
-    sql: string,
-    params: unknown[] = [],
-  ): Promise<T[]> {
-    const result = await this.pool.query<T>(sql, params);
-    return result.rows;
+  async onModuleInit() {
+    await this.source.initialize();
   }
 
-  async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await work(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+  ormTransaction<T>(
+    work: (manager: EntityManager) => Promise<T>,
+    isolationLevel?: TransactionIsolationLevel,
+  ): Promise<T> {
+    return isolationLevel
+      ? this.source.transaction(isolationLevel, work)
+      : this.source.transaction(work);
+  }
+
+  getRepository<Entity extends ObjectLiteral>(
+    target: EntityTarget<Entity>,
+  ): Repository<Entity> {
+    return this.source.getRepository(target);
   }
 
   async onModuleDestroy() {
-    await this.pool.end();
+    if (this.source.isInitialized) await this.source.destroy();
   }
 }

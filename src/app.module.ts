@@ -1,27 +1,31 @@
 import { APP_FILTER, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { HttpExceptionFilter } from './common/http-exception.filter';
+import { BearerAuthGuard } from './common/bearer-auth';
 import { SuccessInterceptor } from './common/success.interceptor';
 import { Module, ValidationPipe } from '@nestjs/common';
 import { DatabaseService } from './utils/database.service';
 import { Channels } from './inbox/channels';
-import { AgentGuard } from './inbox/auth';
-import { WebhookGuard } from './webhook/webhook.guard';
 import { WebhookService } from './webhook/webhook.service';
 import { WebhookController } from './webhook/webhook.controller';
 import { InboxService } from './inbox/inbox.service';
 import { EventsService } from './inbox/events.service';
 import { SendWorker } from './inbox/send.worker';
 import { InboxController } from './inbox/inbox.controller';
+import { AgentsController } from './admin/agents.controller';
 import { HealthController } from './health.controller';
 
 @Module({
   imports: [],
-  controllers: [HealthController, InboxController, WebhookController],
+  controllers: [
+    HealthController,
+    InboxController,
+    AgentsController,
+    WebhookController,
+  ],
   providers: [
     DatabaseService,
     Channels,
-    AgentGuard,
-    WebhookGuard,
+    BearerAuthGuard,
     InboxService,
     WebhookService,
     EventsService,

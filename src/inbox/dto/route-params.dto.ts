@@ -1,9 +1,15 @@
-import { IsUUID } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { IsInt, Max, Min } from 'class-validator';
 import { NonBlankString } from '../../common/validation.decorators';
 
 export class ConversationParamsDto {
-  @IsUUID('all')
-  id: string;
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value,
+  )
+  @IsInt()
+  @Min(1)
+  @Max(2147483647)
+  id: number;
 }
 
 export class LocationParamsDto {

@@ -1,11 +1,12 @@
 import { Body, Controller, HttpCode, Post, UseGuards } from '@nestjs/common';
+import { BearerAuthGuard, UseBearerToken } from '../common/bearer-auth';
 import { InboundWebhookDto } from './dto/inbound-webhook.dto';
 import { StatusWebhookDto } from './dto/status-webhook.dto';
-import { WebhookGuard } from './webhook.guard';
 import { WebhookService } from './webhook.service';
 
 @Controller('webhooks')
-@UseGuards(WebhookGuard)
+@UseBearerToken('WEBHOOK_TOKEN')
+@UseGuards(BearerAuthGuard)
 export class WebhookController {
   constructor(private readonly webhook: WebhookService) {}
   @Post('inbound')

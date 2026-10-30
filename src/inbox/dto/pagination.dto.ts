@@ -24,9 +24,14 @@ export class ConversationQueryDto extends PaginationDto {
   @IsIn(['open', 'closed'])
   status?: 'open' | 'closed';
 
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value,
+  )
   @ValidateIf((_: ConversationQueryDto, value: unknown) => value !== undefined)
-  @NonBlankString()
-  assignedTo?: string;
+  @IsInt()
+  @Min(1)
+  @Max(2147483647)
+  assignedTo?: number;
 }
 
 export class SearchMessagesDto extends PaginationDto {

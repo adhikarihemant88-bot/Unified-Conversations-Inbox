@@ -1,5 +1,4 @@
-import { IsIn, ValidateIf } from 'class-validator';
-import { NonBlankString } from '../../common/validation.decorators';
+import { IsIn, IsInt, Max, Min, ValidateIf } from 'class-validator';
 
 export class UpdateConversationDto {
   // Require status when neither field is supplied, rejecting an empty patch.
@@ -15,6 +14,8 @@ export class UpdateConversationDto {
     (_: UpdateConversationDto, value: unknown) =>
       value !== undefined && value !== null,
   )
-  @NonBlankString()
-  assignedTo?: string | null;
+  @IsInt()
+  @Min(1)
+  @Max(2147483647)
+  assignedTo?: number | null;
 }

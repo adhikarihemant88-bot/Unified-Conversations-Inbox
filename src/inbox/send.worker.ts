@@ -4,9 +4,12 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
+import { LessThan } from 'typeorm';
 import { DatabaseService } from '../utils/database.service';
 import { Channels } from './channels';
-import type { Channel, DeliveryStatus } from './domain';
+import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
+import { SendJob } from '../entities/send-job.entity';
+import { Message } from '../entities/message.entity';
 import { applyStatus, providerLock } from '../webhook/webhook.storage';
 
 @Injectable()
@@ -42,51 +45,46 @@ export class SendWorker implements OnModuleInit, OnModuleDestroy {
     for (let i = 0; i < 20 && !this.stopping; i++)
       if (!(await this.processOne())) break;
     if (++this.ticks % 240 === 0)
-      await this.db.query(
-        'DELETE FROM pagination_snapshots WHERE expires_at<clock_timestamp()',
+      await this.db.ormTransaction((manager) =>
+        manager.getRepository(PaginationSnapshot).delete({
+          expiresAt: LessThan(new Date()),
+        }),
       );
   }
   async processOne(): Promise<boolean> {
-    return this.db.transaction(async (c) => {
-      const job = (
-        await c.query<{
-          message_id: string;
-          attempts: number;
-        }>(`SELECT message_id,attempts FROM send_jobs WHERE state='pending' AND next_attempt_at<=clock_timestamp()
-        ORDER BY next_attempt_at,message_id LIMIT 1 FOR UPDATE SKIP LOCKED`)
-      ).rows[0];
+    return this.db.ormTransaction(async (manager) => {
+      const jobs = manager.getRepository(SendJob);
+      const job = await jobs
+        .createQueryBuilder('job')
+        .where('job.state = :state', { state: 'pending' })
+        .andWhere('job.nextAttemptAt <= :now', { now: new Date() })
+        .orderBy('job.nextAttemptAt', 'ASC')
+        .addOrderBy('job.messageId', 'ASC')
+        .setLock('pessimistic_write')
+        .setOnLocked('skip_locked')
+        .getOne();
       if (!job) return false;
-      const message = (
-        await c.query<{
-          provider_message_id: string;
-          channel: Channel;
-          recipient: string;
-          body: string;
-          status: DeliveryStatus;
-        }>(
-          'SELECT provider_message_id,channel,recipient,body,status FROM messages WHERE id=$1',
-          [job.message_id],
-        )
-      ).rows[0];
-      await providerLock(c, message.provider_message_id);
-      const current = (
-        await c.query<{ status: DeliveryStatus }>(
-          'SELECT status FROM messages WHERE id=$1 FOR UPDATE',
-          [job.message_id],
-        )
-      ).rows[0];
+      const messages = manager.getRepository(Message);
+      const message = await messages.findOneByOrFail({
+        id: job.messageId,
+      });
+      await providerLock(manager, message.providerMessageId);
+      const current = await messages.findOne({
+        where: { id: job.messageId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!current) throw new Error(`Message ${job.messageId} disappeared`);
       if (current.status !== 'queued') {
-        await c.query("UPDATE send_jobs SET state='done' WHERE message_id=$1", [
-          job.message_id,
-        ]);
+        job.state = 'done';
+        await jobs.save(job);
         return true;
       }
       const attempt = job.attempts + 1;
       let success = false;
       try {
         await this.channels.get(message.channel).send({
-          providerMessageId: message.provider_message_id,
-          to: message.recipient,
+          providerMessageId: message.providerMessageId,
+          to: message.to,
           body: message.body,
         });
         success = true;
@@ -95,23 +93,21 @@ export class SendWorker implements OnModuleInit, OnModuleDestroy {
       }
       if (success || attempt >= 3) {
         await applyStatus(
-          c,
-          message.provider_message_id,
+          manager,
+          message.providerMessageId,
           success ? 'sent' : 'failed',
-          new Date().toISOString(),
+          new Date(),
         );
-        await c.query(
-          "UPDATE send_jobs SET attempts=$2,state='done' WHERE message_id=$1",
-          [job.message_id, attempt],
-        );
+        job.attempts = attempt;
+        job.state = 'done';
+        await jobs.save(job);
       } else {
         const base = Number(process.env.RETRY_BASE_MS ?? 1000);
         if (!Number.isFinite(base) || base < 1 || base > 60000)
           throw new Error('RETRY_BASE_MS must be between 1 and 60000');
-        await c.query(
-          "UPDATE send_jobs SET attempts=$2,next_attempt_at=clock_timestamp()+($3::double precision*interval '1 millisecond') WHERE message_id=$1",
-          [job.message_id, attempt, base * 2 ** (attempt - 1)],
-        );
+        job.attempts = attempt;
+        job.nextAttemptAt = new Date(Date.now() + base * 2 ** (attempt - 1));
+        await jobs.save(job);
       }
       return true;
     });

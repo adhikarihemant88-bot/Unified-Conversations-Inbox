@@ -1,9 +1,12 @@
-import { OnModuleDestroy } from '@nestjs/common';
-import { type PoolClient } from 'pg';
-export declare class DatabaseService implements OnModuleDestroy {
-    private readonly pool;
+import { OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { type EntityManager, type EntityTarget, type ObjectLiteral, type Repository } from 'typeorm';
+type TransactionIsolationLevel = 'READ UNCOMMITTED' | 'READ COMMITTED' | 'REPEATABLE READ' | 'SERIALIZABLE';
+export declare class DatabaseService implements OnModuleInit, OnModuleDestroy {
+    private readonly source;
     constructor();
-    query<T extends object>(sql: string, params?: unknown[]): Promise<T[]>;
-    transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T>;
+    onModuleInit(): Promise<void>;
+    ormTransaction<T>(work: (manager: EntityManager) => Promise<T>, isolationLevel?: TransactionIsolationLevel): Promise<T>;
+    getRepository<Entity extends ObjectLiteral>(target: EntityTarget<Entity>): Repository<Entity>;
     onModuleDestroy(): Promise<void>;
 }
+export {};

@@ -1,24 +1,101 @@
-const { Pool } = require('pg');
-const { createHash } = require('node:crypto');
 const { existsSync } = require('node:fs');
+require('reflect-metadata');
+const { DataSource } = require('typeorm');
+const { Agent } = require('../dist/entities/agent.entity');
+const { Contact } = require('../dist/entities/contact.entity');
+const { ContactIdentity } = require('../dist/entities/contact-identity.entity');
+const { Location } = require('../dist/entities/location.entity');
 if (existsSync('.env.local')) process.loadEnvFile('.env.local');
 if (existsSync('.env')) process.loadEnvFile('.env');
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const source = new DataSource({
+  type: 'postgres',
+  url: process.env.DATABASE_URL,
+  entities: [Agent, Contact, ContactIdentity, Location],
+  synchronize: false,
+});
+
 (async () => {
-  const c = await pool.connect();
-  try {
-    await c.query('BEGIN');
+  await source.initialize();
+  const agents = new Map();
+  await source.transaction(async (manager) => {
+    const locations = manager.getRepository(Location);
+    const agentRepository = manager.getRepository(Agent);
     for (const n of [1, 2]) {
-      await c.query('INSERT INTO locations VALUES ($1,$2) ON CONFLICT DO NOTHING', [`loc_${n}`, `Demo location ${n}`]);
-      await c.query('INSERT INTO agents VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [`agent_${n}`, `loc_${n}`, createHash('sha256').update(`demo-agent-${n}-token`).digest('hex')]);
+      const locationName = `loc_${n}`;
+      if (!(await locations.existsBy({ name: locationName })))
+        await locations.save(locations.create({ name: locationName }));
+
+      const name = `Agent ${n}`;
+      const existingAgent = await agentRepository
+        .createQueryBuilder('agent')
+        .where('LOWER(BTRIM(agent.name)) = LOWER(BTRIM(:name))', { name })
+        .getOne();
+      const agent =
+        existingAgent ??
+        (await agentRepository.save(agentRepository.create({ name })));
+      agents.set(`agent_${n}`, agent.id);
     }
-    const id = '00000000-0000-4000-8000-000000000001';
-    await c.query('INSERT INTO contacts VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [id, 'loc_1', 'Demo customer']);
-    for (const [kind, value] of [['phone', '+919876543210'], ['email', 'customer@example.com']]) {
-      await c.query('INSERT INTO contact_identities VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', ['loc_1', id, kind, value]);
+
+    const location = await locations.findOneByOrFail({ name: 'loc_1' });
+    const identities = manager.getRepository(ContactIdentity);
+    const contacts = manager.getRepository(Contact);
+    for (const [name, contactIdentities] of [
+      [
+        'Demo participant A',
+        [
+          ['phone', '+919876543210'],
+          ['email', 'customer@example.com'],
+        ],
+      ],
+      [
+        'Demo participant B',
+        [
+          ['phone', '+918000000000'],
+          ['email', 'inbox@example.com'],
+        ],
+      ],
+    ]) {
+      const [primaryKind, primaryValue] = contactIdentities[0];
+      const existingIdentity = await identities.findOneBy({
+        locationId: location.id,
+        kind: primaryKind,
+        value: primaryValue,
+      });
+      const contact =
+        existingIdentity === null
+          ? await contacts.save(
+              contacts.create({ locationId: location.id, name }),
+            )
+          : await contacts.findOneByOrFail({ id: existingIdentity.contactId });
+
+      for (const [kind, value] of contactIdentities) {
+        if (
+          !(await identities.existsBy({
+            locationId: location.id,
+            kind,
+            value,
+          }))
+        )
+          await identities.save(
+            identities.create({
+              locationId: location.id,
+              contactId: contact.id,
+              kind,
+              value,
+            }),
+          );
+      }
     }
-    await c.query('COMMIT');
-    console.log('Demo seed complete. Agent tokens: demo-agent-1-token / demo-agent-2-token');
-  } catch (error) { await c.query('ROLLBACK'); throw error; }
-  finally { c.release(); }
-})().catch(() => { console.error('Seed failed. Run migrations first and check connectivity.'); process.exitCode = 1; }).finally(() => pool.end());
+  });
+  console.log(
+    `Demo seed complete. Agent IDs: agent_1=${agents.get('agent_1')}, agent_2=${agents.get('agent_2')}.`,
+  );
+})()
+  .catch(() => {
+    console.error('Seed failed. Run migrations first and check connectivity.');
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    if (source.isInitialized) await source.destroy();
+  });

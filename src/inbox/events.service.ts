@@ -5,6 +5,8 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 import type { Response } from 'express';
+import { MoreThan } from 'typeorm';
+import { InboxEvent } from '../entities/inbox-event.entity';
 import { DatabaseService } from '../utils/database.service';
 
 @Injectable()
@@ -12,21 +14,25 @@ export class EventsService implements OnModuleDestroy {
   private readonly logger = new Logger(EventsService.name);
   private readonly connections = new Set<Response>();
   constructor(private readonly db: DatabaseService) {}
-  async open(location: string, lastId: unknown, res: Response) {
+  async open(location: number, lastId: unknown, res: Response) {
     if (
       lastId !== undefined &&
-      (typeof lastId !== 'string' || !/^\d{1,18}$/.test(lastId))
+      (typeof lastId !== 'string' ||
+        !/^\d{1,10}$/.test(lastId) ||
+        Number(lastId) > 2147483647)
     )
       throw new BadRequestException('Invalid Last-Event-ID');
-    let cursor: string =
+    const repository = this.db.getRepository(InboxEvent);
+    let cursor =
       typeof lastId === 'string'
-        ? lastId
-        : (
-            await this.db.query<{ id: string }>(
-              'SELECT COALESCE(MAX(id),0)::text AS id FROM inbox_events WHERE location_id=$1',
-              [location],
-            )
-          )[0].id;
+        ? Number(lastId)
+        : ((
+            await repository.findOne({
+              where: { locationId: location },
+              order: { id: 'DESC' },
+              select: { id: true },
+            })
+          )?.id ?? 0);
     let closed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     this.connections.add(res);
@@ -47,14 +53,11 @@ export class EventsService implements OnModuleDestroy {
     const poll = async () => {
       if (closed) return;
       try {
-        const rows = await this.db.query<{
-          id: string;
-          type: string;
-          payload: unknown;
-        }>(
-          'SELECT id::text,type,payload FROM inbox_events WHERE location_id=$1 AND id>$2 ORDER BY id LIMIT 100',
-          [location, cursor],
-        );
+        const rows = await repository.find({
+          where: { locationId: location, id: MoreThan(cursor) },
+          order: { id: 'ASC' },
+          take: 100,
+        });
         if (closed) return;
         for (const row of rows) {
           if (

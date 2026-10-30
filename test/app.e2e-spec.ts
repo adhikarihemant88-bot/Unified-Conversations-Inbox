@@ -1,27 +1,41 @@
 import { Test } from '@nestjs/testing';
 import { Logger, type INestApplication } from '@nestjs/common';
-import { Pool } from 'pg';
-import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import request from 'supertest';
+import { DataSource, TableCheck } from 'typeorm';
 import { AppModule } from '../src/app.module';
 import { DatabaseService } from '../src/utils/database.service';
 import { Channels } from '../src/inbox/channels';
 import { SendWorker } from '../src/inbox/send.worker';
+import { Contact } from '../src/entities/contact.entity';
+import { ContactIdentity } from '../src/entities/contact-identity.entity';
+import { Conversation } from '../src/entities/conversation.entity';
+import { Location } from '../src/entities/location.entity';
+import { Message } from '../src/entities/message.entity';
+import { Agent } from '../src/entities/agent.entity';
+import { InboxEvent } from '../src/entities/inbox-event.entity';
+import { PaginationSnapshot } from '../src/entities/pagination-snapshot.entity';
+import { ProviderState } from '../src/entities/provider-state.entity';
+import { SendJob } from '../src/entities/send-job.entity';
 
 describe('Inbox (real PostgreSQL)', () => {
   let app: INestApplication;
-  let admin: Pool;
+  let admin: DataSource;
+  let schemaDataSource: DataSource;
   let db: DatabaseService;
   let channels: Channels;
   let worker: SendWorker;
   let base: string;
+  let locOne: number;
+  let locTwo: number;
+  let agentOneId: number;
+  let agentTwoId: number;
   const schema = `test_${randomUUID().replaceAll('-', '')}`;
-  const auth = { Authorization: 'Bearer agent-one' };
-  const auth2 = { Authorization: 'Bearer agent-two' };
-  const webhook = { 'x-webhook-token': 'test-webhook' };
+  const auth = { Authorization: 'Bearer test-inbox' };
+  const auth2 = { Authorization: 'Bearer test-webhook' };
+  const webhook = { Authorization: 'Bearer test-webhook' };
   const payload = (id = randomUUID(), extra: Record<string, unknown> = {}) => ({
     providerMessageId: id,
     locationId: 'loc_1',
@@ -53,29 +67,47 @@ describe('Inbox (real PostgreSQL)', () => {
       .get(`/locations/loc_1/conversations${query}`)
       .set(auth)
       .expect(200);
-  const history = (id: string, query = '') =>
+  const history = (id: number, query = '') =>
     request(app.getHttpServer())
       .get(`/conversations/${id}/messages${query}`)
       .set(auth)
       .expect(200);
+  const makeSendJobsDue = async () => {
+    const jobs = await db.getRepository(SendJob).find();
+    for (const job of jobs) job.nextAttemptAt = new Date(0);
+    await db.getRepository(SendJob).save(jobs);
+  };
   beforeAll(async () => {
     if (!process.env.TEST_DATABASE_URL)
       throw new Error(
         'Run npm run test:e2e for a disposable PostgreSQL server',
       );
-    admin = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
-    await admin.query(`CREATE SCHEMA ${schema}`);
-    const c = await admin.connect();
-    try {
-      await c.query(`SET search_path TO ${schema}`);
-      await c.query(readFileSync('db/001_init.sql', 'utf8'));
-    } finally {
-      c.release();
-    }
+    admin = new DataSource({
+      type: 'postgres',
+      url: process.env.TEST_DATABASE_URL,
+      entities: [],
+      synchronize: false,
+    });
+    await admin.initialize();
+    const schemaRunner = admin.createQueryRunner();
+    await schemaRunner.createSchema(schema);
+    await schemaRunner.release();
     const url = new URL(process.env.TEST_DATABASE_URL);
     url.searchParams.set('options', `-c search_path=${schema}`);
     process.env.DATABASE_URL = url.toString();
+    await promisify(execFile)(process.execPath, ['scripts/migrate.cjs'], {
+      env: process.env,
+    });
+    schemaDataSource = new DataSource({
+      type: 'postgres',
+      url: process.env.DATABASE_URL,
+      entities: [InboxEvent],
+      synchronize: false,
+    });
+    await schemaDataSource.initialize();
     process.env.WEBHOOK_TOKEN = 'test-webhook';
+    process.env.ADMIN_TOKEN = 'test-admin';
+    process.env.INBOX_TOKEN = 'test-inbox';
     process.env.WORKER_ENABLED = 'false';
     process.env.MOCK_FAILURE_RATE = '0';
     const module = await Test.createTestingModule({
@@ -90,28 +122,85 @@ describe('Inbox (real PostgreSQL)', () => {
   }, 30000);
   beforeEach(async () => {
     jest.restoreAllMocks();
-    await db.query(
-      'TRUNCATE pagination_snapshots,inbox_events,send_jobs,provider_states,messages,conversations,contact_identities,contacts,agents,locations CASCADE',
-    );
-    await db.query(
-      "INSERT INTO locations VALUES ('loc_1','One'),('loc_2','Two')",
-    );
-    for (const [id, location, token] of [
-      ['agent_1', 'loc_1', 'agent-one'],
-      ['agent_2', 'loc_2', 'agent-two'],
-    ]) {
-      await db.query('INSERT INTO agents VALUES ($1,$2,$3)', [
-        id,
-        location,
-        createHash('sha256').update(token).digest('hex'),
+    await db.ormTransaction(async (manager) => {
+      await manager
+        .getRepository(PaginationSnapshot)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(InboxEvent)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(SendJob)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(ProviderState)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(Message)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(Conversation)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(ContactIdentity)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(Contact)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(Agent)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await manager
+        .getRepository(Location)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      const locations = manager.getRepository(Location);
+      const [one, two] = await locations.save([
+        locations.create({ name: 'loc_1' }),
+        locations.create({ name: 'loc_2' }),
       ]);
-    }
+      locOne = one.id;
+      locTwo = two.id;
+      const agents = manager.getRepository(Agent);
+      const [agentOne, agentTwo] = await agents.save([
+        agents.create({
+          name: 'Agent One',
+        }),
+        agents.create({
+          name: 'Agent Two',
+        }),
+      ]);
+      agentOneId = agentOne.id;
+      agentTwoId = agentTwo.id;
+    });
   });
   afterAll(async () => {
     if (app) await app.close();
+    if (schemaDataSource) await schemaDataSource.destroy();
     if (admin) {
-      await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-      await admin.end();
+      const schemaRunner = admin.createQueryRunner();
+      await schemaRunner.dropSchema(schema, true, true);
+      await schemaRunner.release();
+      await admin.destroy();
     }
   });
 
@@ -127,154 +216,442 @@ describe('Inbox (real PostgreSQL)', () => {
     );
     expect(responses.filter((r) => r.status === 200)).toHaveLength(1);
     expect(responses.filter((r) => r.status === 409)).toHaveLength(29);
-    expect((await list()).body.data.items[0].unreadCount).toBe(1);
-    expect(
-      (await db.query<{ count: string }>('SELECT count(*) FROM messages'))[0]
-        .count,
-    ).toBe('1');
-    expect(
-      (
-        await db.query<{ count: string }>('SELECT count(*) FROM inbox_events')
-      )[0].count,
-    ).toBe('1');
+    expect((await list()).body.data[0].unreadCount).toBe(1);
+    expect(await db.getRepository(Message).count()).toBe(1);
+    expect(await db.getRepository(InboxEvent).count()).toBe(1);
   });
-  it('50 parallel first messages create one contact/conversation and unreadCount=50', async () => {
-    await Promise.all(Array.from({ length: 50 }, () => inbound()));
-    const rows = (await list()).body.data.items;
-    expect(rows).toHaveLength(1);
-    expect(rows[0].unreadCount).toBe(50);
+  it('creates an agent using the admin bearer token', async () => {
+    await request(app.getHttpServer())
+      .post('/admin/agents')
+      .set('Authorization', 'Bearer test-inbox')
+      .send({ name: 'New agent' })
+      .expect(401);
+
+    const response = await request(app.getHttpServer())
+      .post('/admin/agents')
+      .set('Authorization', 'Bearer test-admin')
+      .send({ name: 'New agent' })
+      .expect(201);
+    expect(response.body.data).toMatchObject({
+      id: expect.any(Number),
+      name: 'New agent',
+    });
+    await request(app.getHttpServer())
+      .post('/admin/agents')
+      .set('Authorization', 'Bearer test-admin')
+      .send({ name: ' new agent ' })
+      .expect(409);
+    await request(app.getHttpServer())
+      .get('/locations/loc_1/conversations')
+      .set(auth)
+      .expect(200);
+  });
+  it('does not create duplicate agents for simultaneous requests', async () => {
+    const responses = await Promise.all([
+      request(app.getHttpServer())
+        .post('/admin/agents')
+        .set('Authorization', 'Bearer test-admin')
+        .send({ name: 'Support Agent 1' }),
+      request(app.getHttpServer())
+        .post('/admin/agents')
+        .set('Authorization', 'Bearer test-admin')
+        .send({ name: 'Support Agent 1' }),
+    ]);
     expect(
-      (await db.query<{ count: string }>('SELECT count(*) FROM contacts'))[0]
-        .count,
-    ).toBe('1');
+      responses.map((response) => response.status).sort((a, b) => a - b),
+    ).toEqual([201, 409]);
     expect(
-      (await db.query<{ count: string }>('SELECT count(*) FROM messages'))[0]
-        .count,
-    ).toBe('50');
-    const events = await db.query<{
-      payload: { conversation: { unreadCount: number } };
-    }>('SELECT payload FROM inbox_events ORDER BY id');
-    expect(events.map((e) => e.payload.conversation.unreadCount)).toEqual(
-      Array.from({ length: 50 }, (_, i) => i + 1),
+      await db.ormTransaction((manager) =>
+        manager.getRepository(Agent).countBy({ name: 'Support Agent 1' }),
+      ),
+    ).toBe(1);
+  });
+  it('assigns new conversations to the least recently assigned agent', async () => {
+    const thirdAgent = await db.ormTransaction((manager) =>
+      manager.getRepository(Agent).save(
+        manager.getRepository(Agent).create({
+          name: 'Third agent',
+        }),
+      ),
     );
+    const conversationIds: number[] = [];
+    for (const suffix of ['1', '2', '3']) {
+      const response = await inbound(
+        payload(undefined, { from: `+91900000000${suffix}` }),
+      );
+      conversationIds.push(response.body.data.message.conversationId);
+    }
+    const rows = (await list()).body.data;
+    const assignmentByConversation = new Map(
+      rows.map((row: { conversationId: number; assignedTo: number }) => [
+        row.conversationId,
+        row.assignedTo,
+      ]),
+    );
+    expect(
+      conversationIds.map((id) => assignmentByConversation.get(id)),
+    ).toEqual([agentOneId, agentTwoId, thirdAgent.id]);
+  });
+  it('coordinates global agent assignment across different locations', async () => {
+    const [one, two] = await Promise.all([
+      inbound(
+        payload(undefined, {
+          locationId: 'loc_1',
+          from: '+919100000001',
+        }),
+      ),
+      inbound(
+        payload(undefined, {
+          locationId: 'loc_2',
+          from: '+919100000002',
+        }),
+      ),
+    ]);
+    const assigned = [
+      one.body.data.message.conversationId,
+      two.body.data.message.conversationId,
+    ];
+    const rows = await db.getRepository(Conversation).find({
+      where: assigned.map((id) => ({ id })),
+      order: { id: 'ASC' },
+    });
+    expect(rows.map((row) => row.assignedTo).sort((a, b) => a - b)).toEqual(
+      [agentOneId, agentTwoId].sort((a, b) => a - b),
+    );
+  });
+  it.each([
+    {
+      kind: 'phone',
+      senders: [
+        { channel: 'sms', from: '+91 98765 43210', to: '+91 80000 00000' },
+        {
+          channel: 'whatsapp',
+          from: 'whatsapp:+919876543210',
+          to: '+918000000000',
+        },
+        { channel: 'sms', from: '+91 80000 00000', to: '+91 98765 43210' },
+        {
+          channel: 'whatsapp',
+          from: 'whatsapp:+918000000000',
+          to: '+919876543210',
+        },
+      ],
+    },
+    {
+      kind: 'email',
+      senders: [
+        {
+          channel: 'email',
+          from: 'Customer@Example.com',
+          to: 'inbox@example.com',
+        },
+        {
+          channel: 'email',
+          from: 'customer@example.com',
+          to: 'inbox@example.com',
+        },
+        {
+          channel: 'email',
+          from: 'Inbox@Example.com',
+          to: 'Customer@Example.com',
+        },
+      ],
+    },
+  ])(
+    '50 parallel first $kind messages in both directions create two contacts and one conversation with unreadCount=50',
+    async ({ senders }) => {
+      await Promise.all(
+        Array.from({ length: 50 }, (_, i) =>
+          inbound(payload(undefined, senders[i % senders.length])),
+        ),
+      );
+      const rows = (await list()).body.data;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].unreadCount).toBe(50);
+      expect(await db.getRepository(Contact).count()).toBe(2);
+      expect(
+        await db.ormTransaction((manager) =>
+          manager.getRepository(ContactIdentity).count(),
+        ),
+      ).toBe(2);
+      expect(await db.getRepository(Message).count()).toBe(50);
+      const events = await db.getRepository(InboxEvent).find({
+        order: { id: 'ASC' },
+      });
+      expect(events.map((e) => e.payload.conversation.unreadCount)).toEqual(
+        Array.from({ length: 50 }, (_, i) => i + 1),
+      );
+    },
+  );
+  it('keeps A-B and A-C as separate conversations at the same location', async () => {
+    const first = (await inbound()).body.data.message;
+    const thirdAddress = '+917000000000';
+    const second = (await inbound(payload(undefined, { to: thirdAddress })))
+      .body.data.message;
+    const reply = (
+      await inbound(
+        payload(undefined, { from: thirdAddress, to: '+919876543210' }),
+      )
+    ).body.data.message;
+    expect(second.conversationId).not.toBe(first.conversationId);
+    expect(reply.conversationId).toBe(second.conversationId);
+    expect((await list()).body.data).toHaveLength(2);
+    expect((await history(first.conversationId)).body.data.items).toHaveLength(
+      1,
+    );
+    expect((await history(second.conversationId)).body.data.items).toHaveLength(
+      2,
+    );
+    expect(
+      await db.ormTransaction((manager) =>
+        manager.getRepository(Contact).count(),
+      ),
+    ).toBe(3);
   });
   it('unifies normalized SMS/WhatsApp phone identities and explicitly linked email', async () => {
     const first = (await inbound()).body.data.message;
-    const contact = (await list()).body.data.items[0].contactId;
-    await db.query(
-      "INSERT INTO contact_identities VALUES ('loc_1',$1,'email','customer@example.com')",
-      [contact],
-    );
-    await inbound(
-      payload(undefined, {
-        channel: 'whatsapp',
-        from: 'whatsapp:+919876543210',
-      }),
-    );
-    await inbound(
-      payload(undefined, {
-        channel: 'email',
-        from: 'Customer@Example.com',
-        to: 'inbox@example.com',
-      }),
-    );
-    expect((await list()).body.data.items).toHaveLength(1);
+    await db.ormTransaction(async (manager) => {
+      const identities = manager.getRepository(ContactIdentity);
+      for (const [phone, email] of [
+        ['+919876543210', 'customer@example.com'],
+        ['+918000000000', 'inbox@example.com'],
+      ]) {
+        const identity = await identities.findOneByOrFail({
+          locationId: locOne,
+          kind: 'phone',
+          value: phone,
+        });
+        await identities.insert({
+          locationId: locOne,
+          contactId: identity.contactId,
+          kind: 'email',
+          value: email,
+        });
+      }
+    });
+    const whatsapp = (
+      await inbound(
+        payload(undefined, {
+          channel: 'whatsapp',
+          from: 'whatsapp:+919876543210',
+        }),
+      )
+    ).body.data.message;
+    const email = (
+      await inbound(
+        payload(undefined, {
+          channel: 'email',
+          from: 'Customer@Example.com',
+          to: 'inbox@example.com',
+        }),
+      )
+    ).body.data.message;
+    expect(whatsapp.conversationId).toBe(first.conversationId);
+    expect(email.conversationId).toBe(first.conversationId);
+    const summaries = (await list()).body.data;
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0].conversationId).toBe(first.conversationId);
+    expect(summaries[0].lastMessageChannel).toBe('email');
     expect((await history(first.conversationId)).body.data.items).toHaveLength(
       3,
     );
+    const outbound = await request(app.getHttpServer())
+      .post(`/conversations/${first.conversationId}/messages`)
+      .set(auth)
+      .send({ channel: 'whatsapp', body: 'Reply using the same pair' })
+      .expect(202);
+    expect(outbound.body.data).toMatchObject({
+      conversationId: first.conversationId,
+      from: '+918000000000',
+      to: '+919876543210',
+      status: 'queued',
+    });
   });
-  it('isolates identical phone numbers in different locations', async () => {
-    await inbound();
-    await inbound(payload(undefined, { locationId: 'loc_2' }));
-    expect(
-      (await db.query<{ count: string }>('SELECT count(*) FROM contacts'))[0]
-        .count,
-    ).toBe('2');
-    expect((await list()).body.data.items).toHaveLength(1);
-  });
-  it('parallel phone and email messages share the first conversation for a linked contact', async () => {
-    const id = randomUUID();
-    await db.query("INSERT INTO contacts(id,location_id) VALUES ($1,'loc_1')", [
-      id,
-    ]);
-    await db.query(
-      "INSERT INTO contact_identities VALUES ('loc_1',$1,'phone','+919876543210'),('loc_1',$1,'email','customer@example.com')",
-      [id],
-    );
-    await Promise.all(
+  it.each([
+    { channel: 'sms', from: '+91 98765 43210', to: '+91 80000 00000' },
+    { channel: 'email', from: 'customer@example.com', to: 'inbox@example.com' },
+  ])(
+    'merges both directions of a $channel pair within each location and separates locations',
+    async (sender) => {
+      const first = (await inbound(payload(undefined, sender))).body.data
+        .message;
+      const second = (
+        await inbound(payload(undefined, { ...sender, locationId: 'loc_2' }))
+      ).body.data.message;
+      const reversed = { ...sender, from: sender.to, to: sender.from };
+      const firstReply = (await inbound(payload(undefined, reversed))).body.data
+        .message;
+      const secondReply = (
+        await inbound(payload(undefined, { ...reversed, locationId: 'loc_2' }))
+      ).body.data.message;
+      expect(firstReply.conversationId).toBe(first.conversationId);
+      expect(secondReply.conversationId).toBe(second.conversationId);
+      expect(second.conversationId).not.toBe(first.conversationId);
+      expect(await db.getRepository(Contact).count()).toBe(4);
+      expect(await db.getRepository(Conversation).count()).toBe(2);
+      expect((await list()).body.data).toHaveLength(1);
+    },
+  );
+  it('parallel SMS, WhatsApp and email messages share one conversation for a linked pair', async () => {
+    const [first, second] = await db.ormTransaction(async (manager) => {
+      const contacts = manager.getRepository(Contact);
+      const created = await contacts.save([
+        contacts.create({ locationId: locOne }),
+        contacts.create({ locationId: locOne }),
+      ]);
+      const [first, second] = created.map((contact) => contact.id);
+      await manager.getRepository(ContactIdentity).insert([
+        {
+          locationId: locOne,
+          contactId: first,
+          kind: 'phone',
+          value: '+919876543210',
+        },
+        {
+          locationId: locOne,
+          contactId: first,
+          kind: 'email',
+          value: 'customer@example.com',
+        },
+        {
+          locationId: locOne,
+          contactId: second,
+          kind: 'phone',
+          value: '+918000000000',
+        },
+        {
+          locationId: locOne,
+          contactId: second,
+          kind: 'email',
+          value: 'inbox@example.com',
+        },
+      ]);
+      return created.map((contact) => contact.id);
+    });
+    const senders = [
+      { channel: 'sms', from: '+91 98765 43210', to: '+91 80000 00000' },
+      {
+        channel: 'whatsapp',
+        from: 'whatsapp:+919876543210',
+        to: '+918000000000',
+      },
+      {
+        channel: 'email',
+        from: 'customer@example.com',
+        to: 'inbox@example.com',
+      },
+      { channel: 'sms', from: '+918000000000', to: '+919876543210' },
+      {
+        channel: 'email',
+        from: 'Inbox@Example.com',
+        to: 'Customer@Example.com',
+      },
+    ];
+    const responses = await Promise.all(
       Array.from({ length: 50 }, (_, i) =>
-        inbound(
-          payload(
-            undefined,
-            i % 2 === 0
-              ? {}
-              : {
-                  channel: 'email',
-                  from: 'customer@example.com',
-                  to: 'inbox@example.com',
-                },
-          ),
-        ),
+        inbound(payload(undefined, senders[i % senders.length])),
       ),
     );
-    const rows = (await list()).body.data.items;
+    const rows = (await list()).body.data;
     expect(rows).toHaveLength(1);
-    expect(rows[0].contactId).toBe(id);
+    expect([first, second]).toContain(rows[0].contactId);
     expect(rows[0].unreadCount).toBe(50);
     expect(
-      (await db.query<{ count: string }>('SELECT count(*) FROM contacts'))[0]
-        .count,
-    ).toBe('1');
+      new Set(responses.map((r) => r.body.data.message.conversationId)),
+    ).toEqual(new Set([rows[0].conversationId]));
+    expect(await db.getRepository(Contact).count()).toBe(2);
   });
-  it('existing contacts do not wait on an identity-creation lock', async () => {
-    await inbound();
-    let ready!: () => void;
-    let release!: () => void;
-    const acquired = new Promise<void>((resolve) => {
-      ready = resolve;
-    });
-    const unlock = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const holding = db.transaction(async (c) => {
-      await c.query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('identity:' || $1, 0))",
-        [JSON.stringify(['loc_1', 'phone', '+919876543210'])],
+  it('reuses the existing location and contact without changing their details', async () => {
+    const id = await db.ormTransaction(async (manager) => {
+      const contact = await manager.getRepository(Contact).save(
+        manager.getRepository(Contact).create({
+          locationId: locOne,
+          name: 'Existing customer',
+        }),
       );
-      ready();
-      await unlock;
+      await manager.getRepository(ContactIdentity).insert({
+        locationId: locOne,
+        contactId: contact.id,
+        kind: 'phone',
+        value: '+919876543210',
+      });
+      return contact.id;
     });
-    try {
-      await acquired;
-      await request(app.getHttpServer())
-        .post('/webhooks/inbound')
-        .set(webhook)
-        .send(payload())
-        .timeout({ deadline: 2000 })
-        .expect(200);
-    } finally {
-      release();
-      await holding;
-    }
-    expect((await list()).body.data.items[0].unreadCount).toBe(2);
+    const first = (await inbound()).body.data.message;
+    const second = (await inbound()).body.data.message;
+    expect(second.conversationId).toBe(first.conversationId);
+    const conversation = (await list()).body.data[0];
+    expect(conversation.contactId).toBe(id);
+    const contacts = await db.ormTransaction((manager) =>
+      manager.getRepository(Contact).find(),
+    );
+    expect(contacts).toHaveLength(2);
+    expect(contacts.find((contact) => contact.id === id)?.name).toBe(
+      'Existing customer',
+    );
+    const location = await db.ormTransaction((manager) =>
+      manager.getRepository(Location).findOneByOrFail({ id: locOne }),
+    );
+    expect(location.name).toBe('loc_1');
+    expect((await list()).body.data[0].unreadCount).toBe(2);
   });
-  it('an unknown location leaves no contact, conversation, message or event', async () => {
-    await request(app.getHttpServer())
-      .post('/webhooks/inbound')
-      .set(webhook)
-      .send(payload(undefined, { locationId: 'missing' }))
-      .expect(404);
-    for (const table of [
-      'contacts',
-      'conversations',
-      'messages',
-      'inbox_events',
-    ]) {
+  it('creates a missing location and continues storing the inbound message', async () => {
+    const locationId = 'loc_new';
+    const response = await inbound(payload(undefined, { locationId }));
+    await db.ormTransaction(async (manager) => {
+      const location = await manager
+        .getRepository(Location)
+        .findOneByOrFail({ name: locationId });
+      expect(location.name).toBe(locationId);
+      expect(location.id).toEqual(expect.any(Number));
+      expect(location.id).toBeGreaterThan(0);
+      const message = await manager
+        .getRepository(Message)
+        .findOneByOrFail({ id: response.body.data.message.id });
+      expect(message.locationId).toBe(location.id);
+      const conversation = await manager
+        .getRepository(Conversation)
+        .findOneByOrFail({ id: message.conversationId });
+      expect(conversation.locationId).toBe(location.id);
+      expect(conversation.unreadCount).toBe(1);
+      for (const id of [
+        conversation.participantAId,
+        conversation.participantBId,
+      ]) {
+        const contact = await manager
+          .getRepository(Contact)
+          .findOneByOrFail({ id });
+        expect(contact.locationId).toBe(location.id);
+      }
+    });
+  });
+  it('creates one missing location for concurrent inbound messages', async () => {
+    const locationId = 'loc_new';
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        inbound(payload(undefined, { locationId })),
+      ),
+    );
+    expect(
+      new Set(responses.map((r) => r.body.data.message.conversationId)).size,
+    ).toBe(1);
+    await db.ormTransaction(async (manager) => {
       expect(
-        (await db.query<{ count: string }>(`SELECT count(*) FROM ${table}`))[0]
-          .count,
-      ).toBe('0');
-    }
+        await manager.getRepository(Location).countBy({ name: locationId }),
+      ).toBe(1);
+      const location = await manager
+        .getRepository(Location)
+        .findOneByOrFail({ name: locationId });
+      expect(
+        await manager
+          .getRepository(Message)
+          .countBy({ locationId: location.id }),
+      ).toBe(10);
+      const conversation = await manager
+        .getRepository(Conversation)
+        .findOneByOrFail({ locationId: location.id });
+      expect(conversation.unreadCount).toBe(10);
+    });
   });
   it('rejects a reused provider ID with different payload/location', async () => {
     const body = payload();
@@ -282,8 +659,13 @@ describe('Inbox (real PostgreSQL)', () => {
     await request(app.getHttpServer())
       .post('/webhooks/inbound')
       .set(webhook)
-      .send({ ...body, locationId: 'loc_2' })
+      .send({ ...body, locationId: 'loc_new' })
       .expect(409);
+    expect(
+      await db.ormTransaction((manager) =>
+        manager.getRepository(Location).existsBy({ name: 'loc_new' }),
+      ),
+    ).toBe(false);
   });
   it('parallel reordered statuses never regress', async () => {
     const m = (await inbound()).body.data.message;
@@ -328,22 +710,89 @@ describe('Inbox (real PostgreSQL)', () => {
     await request(app.getHttpServer())
       .patch(`/conversations/${m.conversationId}`)
       .set(auth)
-      .send({ status: 'closed', assignedTo: 'agent_1' })
+      .send({ status: 'closed', assignedTo: agentOneId })
       .expect(200);
     await inbound(body, 409);
-    expect((await list()).body.data.items[0].status).toBe('closed');
+    expect((await list()).body.data[0].status).toBe('closed');
     await inbound();
-    expect((await list()).body.data.items[0].status).toBe('open');
+    expect((await list()).body.data[0].status).toBe('open');
     expect(
-      (await list('?status=open&assignedTo=agent_1')).body.data.items,
+      (await list(`?status=open&assignedTo=${agentOneId}`)).body.data,
     ).toHaveLength(1);
+  });
+  it('returns conversation summaries with the latest channel and root pagination metadata', async () => {
+    await inbound();
+    const response = await list('?limit=1');
+
+    expect(Array.isArray(response.body.data)).toBe(true);
+    expect(response.body.data).toHaveLength(1);
+    expect(response.body.data[0]).toMatchObject({
+      contactId: expect.any(Number),
+      lastMessageChannel: 'sms',
+      status: 'open',
+      assignedTo: agentOneId,
+      lastMessagePreview: 'Hello',
+      unreadCount: 1,
+    });
+    expect(response.body.data[0]).toHaveProperty('conversationId');
+    expect(response.body.data[0]).not.toHaveProperty('id');
+    expect(response.body.data[0]).not.toHaveProperty('contact');
+    expect(response.body.data[0]).not.toHaveProperty('participantAId');
+    expect(response.body.data[0]).not.toHaveProperty('participantBId');
+    expect(response.body.data[0]).not.toHaveProperty('messages');
+    expect(response.body).toHaveProperty('nextCursor', null);
+    expect(response.body).toHaveProperty('hasMore', false);
+  });
+  it('outbound replies reverse the latest inbound direction within the same conversation', async () => {
+    const first = (await inbound()).body.data.message;
+    const send = () =>
+      request(app.getHttpServer())
+        .post(`/conversations/${first.conversationId}/messages`)
+        .set(auth)
+        .send({ channel: 'sms', body: 'Reply' })
+        .expect(202);
+    expect((await send()).body.data).toMatchObject({
+      conversationId: first.conversationId,
+      from: '+918000000000',
+      to: '+919876543210',
+    });
+    const reply = (
+      await inbound(
+        payload(undefined, {
+          from: '+918000000000',
+          to: '+919876543210',
+          sentAt: '2026-10-28T10:16:00Z',
+        }),
+      )
+    ).body.data.message;
+    expect(reply.conversationId).toBe(first.conversationId);
+    expect((await send()).body.data).toMatchObject({
+      conversationId: first.conversationId,
+      from: '+919876543210',
+      to: '+918000000000',
+    });
+    expect((await list()).body.data).toHaveLength(1);
+    expect((await history(first.conversationId)).body.data.items).toHaveLength(
+      4,
+    );
+  });
+  it('rejects outbound channels without identities for both participants', async () => {
+    const first = (await inbound()).body.data.message;
+    await request(app.getHttpServer())
+      .post(`/conversations/${first.conversationId}/messages`)
+      .set(auth)
+      .send({ channel: 'email', body: 'Reply' })
+      .expect(400);
+    expect((await history(first.conversationId)).body.data.items).toHaveLength(
+      1,
+    );
   });
   it('late older messages leave the latest preview intact', async () => {
     await inbound(
       payload(undefined, { body: 'Latest', sentAt: '2026-10-29T10:00:00Z' }),
     );
     await inbound(payload(undefined, { body: 'Older' }));
-    const c = (await list()).body.data.items[0];
+    const c = (await list()).body.data[0];
     expect(c.lastMessagePreview).toBe('Latest');
     expect(c.unreadCount).toBe(2);
   });
@@ -356,12 +805,13 @@ describe('Inbox (real PostgreSQL)', () => {
         .expect(200),
       ...Array.from({ length: 20 }, () => inbound()),
     ]);
-    const before = (await list()).body.data.items[0].unreadCount;
+    const before = (await list()).body.data[0].unreadCount;
     expect(before).toBeGreaterThanOrEqual(0);
     expect(before).toBeLessThanOrEqual(20);
-    const events = await db.query<{ type: string }>(
-      'SELECT type FROM inbox_events ORDER BY id',
-    );
+    const events = await db.getRepository(InboxEvent).find({
+      select: { type: true },
+      order: { id: 'ASC' },
+    });
     let expected = 0;
     for (const e of events)
       expected = e.type === 'message.new' ? expected + 1 : 0;
@@ -371,13 +821,13 @@ describe('Inbox (real PostgreSQL)', () => {
       .set(auth)
       .expect(200);
     await Promise.all(Array.from({ length: 10 }, () => inbound()));
-    expect((await list()).body.data.items[0].unreadCount).toBe(10);
+    expect((await list()).body.data[0].unreadCount).toBe(10);
   });
   it('message snapshot pages handle timestamp ties and late inserts', async () => {
-    const ids: string[] = [];
+    const ids: number[] = [];
     for (let n = 0; n < 5; n++)
       ids.push((await inbound()).body.data.message.id);
-    const c = (await list()).body.data.items[0].id;
+    const c = (await list()).body.data[0].conversationId;
     let page = (await history(c, '?limit=2')).body.data;
     const seen = [...page.items];
     await inbound(payload(undefined, { sentAt: '2026-10-20T00:00:00Z' }));
@@ -386,8 +836,8 @@ describe('Inbox (real PostgreSQL)', () => {
       page = (await history(c, `?limit=2&cursor=${page.nextCursor}`)).body.data;
       seen.push(...page.items);
     }
-    const compare = (a: string, b: string) => a.localeCompare(b);
-    expect(seen.map((m) => m.id as string).sort(compare)).toEqual(
+    const compare = (a: number, b: number) => a - b;
+    expect(seen.map((m) => m.id as number).sort(compare)).toEqual(
       ids.sort(compare),
     );
     expect((await history(c)).body.data.items).toHaveLength(7);
@@ -403,8 +853,9 @@ describe('Inbox (real PostgreSQL)', () => {
     ).body.data.message;
     const b = (await inbound(payload(undefined, { from: '+919000000002' })))
       .body.data.message;
-    const page = (await list('?limit=1')).body.data;
-    expect(page.items[0].id).toBe(a.conversationId);
+    const page = await list('?limit=1');
+    expect(page.body.nextCursor).toMatch(/^\d+:\d+$/);
+    expect(page.body.data[0].conversationId).toBe(a.conversationId);
     await inbound(
       payload(undefined, {
         from: '+919000000002',
@@ -412,27 +863,29 @@ describe('Inbox (real PostgreSQL)', () => {
       }),
     );
     await inbound(payload(undefined, { from: '+919000000003' }));
-    const second = (await list(`?limit=1&cursor=${page.nextCursor}`)).body.data;
-    expect(second.items.map((c: { id: string }) => c.id)).toEqual([
-      b.conversationId,
-    ]);
-    expect(second.nextCursor).toBeNull();
+    const second = await list(`?limit=1&cursor=${page.body.nextCursor}`);
+    expect(
+      second.body.data.map((c: { conversationId: number }) => c.conversationId),
+    ).toEqual([b.conversationId]);
+    expect(second.body.nextCursor).toBeNull();
+    expect(second.body.hasMore).toBe(false);
   });
   it('rejects expired cursors and cursors reused with different filters', async () => {
     await inbound();
     await inbound(payload(undefined, { from: '+919000000001' }));
-    const page = (await list('?limit=1')).body.data;
+    const page = await list('?limit=1');
     await request(app.getHttpServer())
       .get(
-        `/locations/loc_1/conversations?status=open&cursor=${page.nextCursor}`,
+        `/locations/loc_1/conversations?status=open&cursor=${page.body.nextCursor}`,
       )
       .set(auth)
       .expect(410);
-    await db.query(
-      "UPDATE pagination_snapshots SET expires_at=clock_timestamp()-interval '1 second'",
-    );
+    const snapshots = await db.getRepository(PaginationSnapshot).find();
+    for (const snapshot of snapshots)
+      snapshot.expiresAt = new Date(Date.now() - 1000);
+    await db.getRepository(PaginationSnapshot).save(snapshots);
     await request(app.getHttpServer())
-      .get(`/locations/loc_1/conversations?cursor=${page.nextCursor}`)
+      .get(`/locations/loc_1/conversations?cursor=${page.body.nextCursor}`)
       .set(auth)
       .expect(410);
   });
@@ -455,10 +908,10 @@ describe('Inbox (real PostgreSQL)', () => {
     expect(send).toHaveBeenCalledTimes(1);
     expect(
       (await history(m.conversationId)).body.data.items.find(
-        (r: { id: string }) => r.id === out.id,
+        (r: { id: number }) => r.id === out.id,
       ).status,
     ).toBe('sent');
-    expect((await list()).body.data.items[0].unreadCount).toBe(1);
+    expect((await list()).body.data[0].unreadCount).toBe(1);
   });
   it('backs off and fails after exactly three persisted attempts', async () => {
     const m = (await inbound()).body.data.message;
@@ -472,13 +925,9 @@ describe('Inbox (real PostgreSQL)', () => {
       .expect(202);
     await worker.processOne();
     expect(await worker.processOne()).toBe(false);
-    expect(
-      (
-        await db.query<{ attempts: number }>('SELECT attempts FROM send_jobs')
-      )[0].attempts,
-    ).toBe(1);
+    expect((await db.getRepository(SendJob).find())[0].attempts).toBe(1);
     for (let n = 0; n < 2; n++) {
-      await db.query('UPDATE send_jobs SET next_attempt_at=clock_timestamp()');
+      await makeSendJobsDue();
       await worker.processOne();
     }
     expect(send).toHaveBeenCalledTimes(3);
@@ -504,40 +953,67 @@ describe('Inbox (real PostgreSQL)', () => {
     expect(send).not.toHaveBeenCalled();
     expect(
       (await history(m.conversationId)).body.data.items.find(
-        (r: { id: string }) => r.id === out.id,
+        (r: { id: number }) => r.id === out.id,
       ).status,
     ).toBe('delivered');
   });
-  it('rolls back message, contact and counter if storing the event fails', async () => {
-    const log = jest
-      .spyOn(Logger.prototype, 'error')
-      .mockImplementation(() => undefined);
-    await db.query(
-      "ALTER TABLE inbox_events ADD CONSTRAINT reject_event CHECK (type <> 'message.new')",
-    );
-    try {
-      const response = await request(app.getHttpServer())
-        .post('/webhooks/inbound')
-        .set(webhook)
-        .send(payload())
-        .expect(500);
-      expect(response.body).toEqual({
-        status: 500,
-        message: 'Internal server error',
-        data: null,
-      });
-      expect(log).toHaveBeenCalled();
-      expect(
-        (await db.query<{ count: string }>('SELECT count(*) FROM messages'))[0]
-          .count,
-      ).toBe('0');
-      expect((await list()).body.data.items).toHaveLength(0);
-    } finally {
-      await db.query('ALTER TABLE inbox_events DROP CONSTRAINT reject_event');
-      log.mockRestore();
-    }
-  });
-  it('enforces tenant boundaries for every agent action and protects webhooks', async () => {
+  it.each(['loc_1', 'loc_new'])(
+    'rolls back inbound state for %s if storing the event fails',
+    async (locationId) => {
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      const runner = schemaDataSource.createQueryRunner();
+      await runner.createCheckConstraint(
+        'inbox_events',
+        new TableCheck({
+          name: 'reject_event',
+          expression: `"type" <> 'message.new'`,
+        }),
+      );
+      try {
+        const response = await request(app.getHttpServer())
+          .post('/webhooks/inbound')
+          .set(webhook)
+          .send(payload(undefined, { locationId }))
+          .expect(500);
+        expect(response.body).toEqual({
+          status: 500,
+          message: 'Internal server error',
+          data: null,
+        });
+        expect(log).toHaveBeenCalled();
+        expect(await db.getRepository(Message).count()).toBe(0);
+        expect((await list()).body.data).toHaveLength(0);
+        expect(
+          await db.ormTransaction((manager) =>
+            manager.getRepository(Contact).count(),
+          ),
+        ).toBe(0);
+        expect(
+          await db.ormTransaction((manager) =>
+            manager.getRepository(ContactIdentity).count(),
+          ),
+        ).toBe(0);
+        expect(
+          await db.ormTransaction((manager) =>
+            manager.getRepository(Location).existsBy({ name: locationId }),
+          ),
+        ).toBe(locationId === 'loc_1');
+      } finally {
+        await runner.dropCheckConstraint(
+          'inbox_events',
+          new TableCheck({
+            name: 'reject_event',
+            expression: `"type" <> 'message.new'`,
+          }),
+        );
+        await runner.release();
+        log.mockRestore();
+      }
+    },
+  );
+  it('requires the module bearer and takes location from the API path', async () => {
     const m = (await inbound()).body.data.message;
     await request(app.getHttpServer())
       .get('/locations/loc_1/conversations')
@@ -545,38 +1021,48 @@ describe('Inbox (real PostgreSQL)', () => {
     await request(app.getHttpServer())
       .get('/locations/loc_1/conversations')
       .set(auth2)
-      .expect(403);
+      .expect(401);
     await request(app.getHttpServer())
       .get(`/conversations/${m.conversationId}/messages`)
       .set(auth2)
-      .expect(404);
+      .expect(401);
     await request(app.getHttpServer())
       .post(`/conversations/${m.conversationId}/read`)
       .set(auth2)
-      .expect(404);
+      .expect(401);
     await request(app.getHttpServer())
       .patch(`/conversations/${m.conversationId}`)
       .set(auth2)
       .send({ status: 'closed' })
-      .expect(404);
+      .expect(401);
     await request(app.getHttpServer())
       .post(`/conversations/${m.conversationId}/messages`)
       .set(auth2)
       .send({ channel: 'sms', body: 'Leak?' })
-      .expect(404);
+      .expect(401);
     await request(app.getHttpServer())
+      .get('/locations/loc_2/conversations')
+      .set(auth)
+      .expect(200);
+    const assigned = await request(app.getHttpServer())
       .patch(`/conversations/${m.conversationId}`)
       .set(auth)
-      .send({ assignedTo: 'agent_2' })
-      .expect(400);
+      .send({ assignedTo: agentTwoId })
+      .expect(200);
+    expect(assigned.body.data.assignedTo).toBe(agentTwoId);
     await request(app.getHttpServer())
       .post('/webhooks/inbound')
       .send(payload())
       .expect(401);
     await request(app.getHttpServer())
+      .post('/webhooks/inbound')
+      .set(auth)
+      .send(payload())
+      .expect(401);
+    await request(app.getHttpServer())
       .get('/locations/loc_1/events')
       .set(auth2)
-      .expect(403);
+      .expect(401);
   });
   it('SSE streams and replays only events from the authorized location', async () => {
     await inbound(
@@ -602,8 +1088,8 @@ describe('Inbox (real PostgreSQL)', () => {
       expect(content).toContain('event: message.new');
       expect(content).not.toContain('FOREIGN_SECRET');
       const eventId = /id: (\d+)/.exec(content)![1];
-      const m = (await history((await list()).body.data.items[0].id)).body.data
-        .items[0];
+      const m = (await history((await list()).body.data[0].conversationId)).body
+        .data.items[0];
       await callback(m.providerMessageId, 'read');
       const replayAbort = new AbortController();
       const replayTimer = setTimeout(() => replayAbort.abort(), 4000);
@@ -675,10 +1161,7 @@ describe('Inbox (real PostgreSQL)', () => {
       expect(response.body.status).toBe(400);
       expect(response.body.data).toBeNull();
     }
-    expect(
-      (await db.query<{ count: string }>('SELECT count(*) FROM messages'))[0]
-        .count,
-    ).toBe('0');
+    expect(await db.getRepository(Message).count()).toBe(0);
   });
   it('status DTO rejects invalid lifecycle values and timestamps before storing orphan states', async () => {
     const valid = {
@@ -699,13 +1182,7 @@ describe('Inbox (real PostgreSQL)', () => {
         .set(webhook)
         .send(body)
         .expect(400);
-    expect(
-      (
-        await db.query<{ count: string }>(
-          'SELECT count(*) FROM provider_states',
-        )
-      )[0].count,
-    ).toBe('0');
+    expect(await db.getRepository(ProviderState).count()).toBe(0);
   });
   it('send DTO rejects invalid channel/body and extra writable fields before enqueueing', async () => {
     const m = (await inbound()).body.data.message;
@@ -721,10 +1198,7 @@ describe('Inbox (real PostgreSQL)', () => {
         .set(auth)
         .send(body)
         .expect(400);
-    expect(
-      (await db.query<{ count: string }>('SELECT count(*) FROM send_jobs'))[0]
-        .count,
-    ).toBe('0');
+    expect(await db.getRepository(SendJob).count()).toBe(0);
   });
   it('patch DTO rejects empty updates and invalid nullable fields, and preserves omitted assignment', async () => {
     const m = (await inbound()).body.data.message;
@@ -732,13 +1206,14 @@ describe('Inbox (real PostgreSQL)', () => {
     await request(app.getHttpServer())
       .patch(path)
       .set(auth)
-      .send({ assignedTo: 'agent_1' })
+      .send({ assignedTo: agentOneId })
       .expect(200);
     for (const body of [
       {},
       { status: null },
       { status: 'archived' },
-      { assignedTo: 123 },
+      { assignedTo: 'agent_1' },
+      { assignedTo: 0 },
       { assignedTo: '' },
       { assignedTo: ' ' },
       { unreadCount: 0 },
@@ -756,7 +1231,7 @@ describe('Inbox (real PostgreSQL)', () => {
       .send({ status: 'closed' })
       .expect(200);
     expect(updated.body.data.status).toBe('closed');
-    expect(updated.body.data.assignedTo).toBe('agent_1');
+    expect(updated.body.data.assignedTo).toBe(agentOneId);
     const unassigned = await request(app.getHttpServer())
       .patch(path)
       .set(auth)
@@ -768,9 +1243,10 @@ describe('Inbox (real PostgreSQL)', () => {
   it('query DTOs transform decimal limits and reject invalid limits, repeated fields and unknown keys', async () => {
     await inbound();
     await inbound(payload(undefined, { from: '+919000000001' }));
-    const first = (await list('?limit=1')).body.data;
-    expect(first.items).toHaveLength(1);
-    expect(first.nextCursor).not.toBeNull();
+    const first = await list('?limit=1');
+    expect(first.body.data).toHaveLength(1);
+    expect(first.body.nextCursor).not.toBeNull();
+    expect(first.body.hasMore).toBe(true);
     for (const query of [
       'limit=0',
       'limit=101',
@@ -784,14 +1260,14 @@ describe('Inbox (real PostgreSQL)', () => {
       'assignedTo=',
       'unexpected=value',
       'cursor=bad',
-      `cursor=${randomUUID()}:9007199254740992`,
+      'cursor=9007199254740992:0',
     ]) {
       await request(app.getHttpServer())
         .get(`/locations/loc_1/conversations?${query}`)
         .set(auth)
         .expect(400);
     }
-    const m = (await list()).body.data.items[0];
+    const m = (await list()).body.data[0];
     await request(app.getHttpServer())
       .get(`/conversations/${m.id}/messages?status=open`)
       .set(auth)
@@ -818,6 +1294,38 @@ describe('Inbox (real PostgreSQL)', () => {
     expect(result.body.data.items).toHaveLength(1);
     expect(result.body.data.items[0].body).toBe('The offer is still valid');
   });
+  it('uses incrementing integer IDs for generated entities', async () => {
+    const first = (await inbound()).body.data.message;
+    const second = (
+      await inbound(payload(undefined, { body: 'A second message' }))
+    ).body.data.message;
+    expect(Number.isInteger(first.id)).toBe(true);
+    expect(second.id).toBeGreaterThan(first.id);
+    expect(Number.isInteger(first.conversationId)).toBe(true);
+    expect(Number.isInteger(agentOneId)).toBe(true);
+    const conversations = await list();
+    expect(Number.isInteger(conversations.body.data[0].conversationId)).toBe(
+      true,
+    );
+
+    const contacts = await db.ormTransaction((manager) =>
+      manager.getRepository(Contact).find({ order: { id: 'ASC' } }),
+    );
+    expect(contacts.map((contact) => contact.id)).toEqual([
+      expect.any(Number),
+      expect.any(Number),
+    ]);
+    expect(contacts[1].id).toBeGreaterThan(contacts[0].id);
+    const snapshot = await db
+      .getRepository(PaginationSnapshot)
+      .findOneByOrFail({ locationId: locOne });
+    const event = await db.getRepository(InboxEvent).findOneByOrFail({
+      locationId: locOne,
+    });
+    expect(Number.isInteger(snapshot.id)).toBe(true);
+    expect(Number.isInteger(event.id)).toBe(true);
+    expect(new Agent()).not.toHaveProperty('locationId');
+  });
   it('migration and seed scripts are repeatable against the isolated database schema', async () => {
     const run = promisify(execFile);
     for (let n = 0; n < 2; n++) {
@@ -826,14 +1334,8 @@ describe('Inbox (real PostgreSQL)', () => {
       });
       await run(process.execPath, ['scripts/seed.cjs'], { env: process.env });
     }
-    const contacts = await db.query<{ count: string }>(
-      'SELECT count(*) FROM contacts',
-    );
-    expect(contacts[0].count).toBe('1');
-    const identities = await db.query<{ count: string }>(
-      'SELECT count(*) FROM contact_identities',
-    );
-    expect(identities[0].count).toBe('2');
+    expect(await db.getRepository(Contact).count()).toBe(2);
+    expect(await db.getRepository(ContactIdentity).count()).toBe(4);
     const first = (await inbound()).body.data.message;
     await inbound(
       payload(undefined, {
@@ -849,11 +1351,56 @@ describe('Inbox (real PostgreSQL)', () => {
   it('enforces composite foreign keys against cross-location references', async () => {
     const m = (await inbound()).body.data.message;
     await expect(
-      db.query(
-        "INSERT INTO messages(id,location_id,conversation_id,provider_message_id,channel,direction,sender,recipient,body,status,sent_at) VALUES ($1,'loc_2',$2,$3,'sms','inbound','x','y','z','delivered',now())",
-        [randomUUID(), m.conversationId, randomUUID()],
+      db.ormTransaction((manager) =>
+        manager.getRepository(Message).save(
+          manager.getRepository(Message).create({
+            locationId: locTwo,
+            conversationId: m.conversationId,
+            providerMessageId: randomUUID(),
+            channel: 'sms',
+            direction: 'inbound',
+            from: 'x',
+            to: 'y',
+            body: 'z',
+            status: 'delivered',
+            sentAt: new Date(),
+          }),
+        ),
       ),
     ).rejects.toMatchObject({ code: '23503' });
+    const conversation = await db.ormTransaction((manager) =>
+      manager
+        .getRepository(Conversation)
+        .findOneByOrFail({ id: m.conversationId }),
+    );
+    const outsiderId = await db.ormTransaction(async (manager) => {
+      const outsider = await manager
+        .getRepository(Contact)
+        .save(manager.getRepository(Contact).create({ locationId: locTwo }));
+      return outsider.id;
+    });
+    const [participantAId, participantBId] = [
+      conversation.participantAId,
+      outsiderId,
+    ].sort((a, b) => a - b);
+    await expect(
+      db.ormTransaction((manager) =>
+        manager.getRepository(Conversation).insert({
+          locationId: locOne,
+          participantAId,
+          participantBId,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: '23503' });
+    await expect(
+      db.ormTransaction((manager) =>
+        manager.getRepository(Conversation).insert({
+          locationId: locOne,
+          participantAId: conversation.participantBId,
+          participantBId: conversation.participantAId,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
   });
   it('recovers a persisted retry job using a new worker instance', async () => {
     const m = (await inbound()).body.data.message;
@@ -869,12 +1416,12 @@ describe('Inbox (real PostgreSQL)', () => {
         .expect(202)
     ).body.data;
     await worker.processOne();
-    await db.query('UPDATE send_jobs SET next_attempt_at=clock_timestamp()');
+    await makeSendJobsDue();
     await new SendWorker(db, channels).processOne();
     expect(send).toHaveBeenCalledTimes(2);
     expect(
       (await history(m.conversationId)).body.data.items.find(
-        (r: { id: string }) => r.id === out.id,
+        (r: { id: number }) => r.id === out.id,
       ).status,
     ).toBe('sent');
   });

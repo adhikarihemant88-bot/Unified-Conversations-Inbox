@@ -4,8 +4,14 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
-import type { PoolClient } from 'pg';
+import { In, type EntityManager } from 'typeorm';
+import { Agent } from '../entities/agent.entity';
+import { ContactIdentity } from '../entities/contact-identity.entity';
+import { Conversation as ConversationEntity } from '../entities/conversation.entity';
+import { Location } from '../entities/location.entity';
+import { Message } from '../entities/message.entity';
+import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
+import { SendJob } from '../entities/send-job.entity';
 import { DatabaseService } from '../utils/database.service';
 import { Channels } from './channels';
 import type { SendMessageDto } from './dto/send-message.dto';
@@ -15,13 +21,15 @@ import type {
   PaginationDto,
   SearchMessagesDto,
 } from './dto/pagination.dto';
-import { conversationSelect, event, messageSelect } from './storage';
+import {
+  conversationView,
+  event,
+  lockLocation,
+  markAgentAssigned,
+  messageView,
+  updateLastMessage,
+} from './storage';
 
-interface Conversation {
-  id: string;
-  location_id: string;
-  contact_id: string;
-}
 @Injectable()
 export class InboxService {
   constructor(
@@ -29,214 +37,400 @@ export class InboxService {
     private readonly channels: Channels,
   ) {}
 
-  async send(location: string, conversationId: string, data: SendMessageDto) {
-    const { channel: medium, body } = data;
-    return this.db.transaction(async (c) => {
-      const conversation = await this.conversation(
-        c,
-        location,
-        conversationId,
-        true,
-      );
-      const kind = this.channels.get(medium).kind;
-      const identity = (
-        await c.query<{ value: string }>(
-          'SELECT value FROM contact_identities WHERE location_id=$1 AND contact_id=$2 AND kind=$3 ORDER BY value LIMIT 1',
-          [location, conversation.contact_id, kind],
-        )
-      ).rows[0];
-      if (!identity)
-        throw new BadRequestException(
-          `Contact has no ${kind} identity for ${medium}`,
-        );
-      const previous = (
-        await c.query<{ recipient: string }>(
-          "SELECT recipient FROM messages WHERE conversation_id=$1 AND location_id=$2 AND channel=$3 AND direction='inbound' ORDER BY sent_at DESC,id DESC LIMIT 1",
-          [conversationId, location, medium],
-        )
-      ).rows[0];
-      const sender =
-        previous?.recipient ??
-        (medium === 'email' ? 'inbox@example.com' : '+918000000000');
-      const id = randomUUID();
-      const sentAt = new Date().toISOString();
-      await c.query(
-        `INSERT INTO messages(id,location_id,conversation_id,provider_message_id,channel,direction,sender,recipient,body,status,sent_at)
-        VALUES ($1,$2,$3,$4,$5,'outbound',$6,$7,$8,'queued',$9)`,
-        [
-          id,
-          location,
-          conversationId,
-          this.channels.allocateId(),
-          medium,
-          sender,
-          identity.value,
-          body,
-          sentAt,
-        ],
-      );
-      await c.query('INSERT INTO send_jobs(message_id) VALUES ($1)', [id]);
-      await this.updateLatest(c, conversationId, id, sentAt, body, false);
-      const message = (await c.query(`${messageSelect} WHERE id=$1`, [id]))
-        .rows[0];
-      await event(c, location, 'message.new', {
-        message,
-        conversation: (
-          await c.query(`${conversationSelect} WHERE id=$1`, [conversationId])
-        ).rows[0],
+  async resolveLocationId(name: string): Promise<number> {
+    const location = await this.db.ormTransaction((manager) =>
+      manager.getRepository(Location).findOneBy({ name }),
+    );
+    if (!location) throw new NotFoundException('Location not found');
+    return location.id;
+  }
+
+  async send(conversationId: number, data: SendMessageDto) {
+    const { channel, body } = data;
+    return this.db.ormTransaction(async (manager) => {
+      const conversations = manager.getRepository(ConversationEntity);
+      const found = await conversations.findOneBy({ id: conversationId });
+      if (!found) throw new NotFoundException('Conversation not found');
+      const location = found.locationId;
+      await lockLocation(manager, location);
+      const conversation = await conversations.findOne({
+        where: { id: conversationId, locationId: location },
+        lock: { mode: 'pessimistic_write' },
       });
-      return message;
-    });
-  }
+      if (!conversation) throw new NotFoundException('Conversation not found');
 
-  private async updateLatest(
-    c: PoolClient,
-    conversationId: string,
-    messageId: string,
-    sentAt: string,
-    body: string,
-    inbound: boolean,
-  ) {
-    await c.query(
-      `UPDATE conversations SET unread_count=unread_count+$5,
-      status=CASE WHEN $5=1 THEN 'open' ELSE status END,
-      last_message_preview=CASE WHEN last_message_at IS NULL OR (last_message_at,last_message_id)<($3::timestamptz,$2::uuid) THEN $4 ELSE last_message_preview END,
-      last_message_id=CASE WHEN last_message_at IS NULL OR (last_message_at,last_message_id)<($3::timestamptz,$2::uuid) THEN $2::uuid ELSE last_message_id END,
-      last_message_at=GREATEST(last_message_at,$3::timestamptz) WHERE id=$1`,
-      [conversationId, messageId, sentAt, body.slice(0, 160), inbound ? 1 : 0],
-    );
-  }
+      const messages = manager.getRepository(Message);
+      const previous = await messages.findOne({
+        where: { locationId: location, conversationId, direction: 'inbound' },
+        order: { sentAt: 'DESC', id: 'DESC' },
+      });
+      if (!previous)
+        throw new BadRequestException(
+          'Conversation has no message to reply to',
+        );
 
-  private async conversation(
-    c: PoolClient,
-    location: string,
-    id: string,
-    lock = false,
-  ): Promise<Conversation> {
-    const row = (
-      await c.query<Conversation>(
-        `SELECT id,location_id,contact_id FROM conversations WHERE location_id=$1 AND id=$2 ${lock ? 'FOR UPDATE' : ''}`,
-        [location, id],
-      )
-    ).rows[0];
-    if (!row) throw new NotFoundException('Conversation not found');
-    return row;
-  }
+      // Reply to the latest inbound sender, independently of participant ID order.
+      const identities = manager.getRepository(ContactIdentity);
+      const previousKind = this.channels.get(previous.channel).kind;
+      const senderContact = await identities.findOneByOrFail({
+        locationId: location,
+        kind: previousKind,
+        value: previous.to,
+      });
+      const recipientContact = await identities.findOneByOrFail({
+        locationId: location,
+        kind: previousKind,
+        value: previous.from,
+      });
+      const kind = this.channels.get(channel).kind;
+      const sender =
+        kind === previousKind
+          ? senderContact
+          : await identities.findOne({
+              where: {
+                locationId: location,
+                contactId: senderContact.contactId,
+                kind,
+              },
+              order: { value: 'ASC' },
+            });
+      const recipient =
+        kind === previousKind
+          ? recipientContact
+          : await identities.findOne({
+              where: {
+                locationId: location,
+                contactId: recipientContact.contactId,
+                kind,
+              },
+              order: { value: 'ASC' },
+            });
+      if (!sender || !recipient) {
+        throw new BadRequestException(
+          `Both participants need a ${kind} identity for ${channel}`,
+        );
+      }
 
-  async read(location: string, id: string) {
-    return this.db.transaction(async (c) => {
-      await this.conversation(c, location, id, true);
-      await c.query('UPDATE conversations SET unread_count=0 WHERE id=$1', [
-        id,
-      ]);
-      const row = (await c.query(`${conversationSelect} WHERE id=$1`, [id]))
-        .rows[0];
-      await event(c, location, 'conversation.updated', row);
-      return row;
-    });
-  }
-
-  async patch(location: string, id: string, data: UpdateConversationDto) {
-    return this.db.transaction(async (c) => {
-      await this.conversation(c, location, id, true);
-      if (
-        typeof data.assignedTo === 'string' &&
-        !(
-          await c.query('SELECT 1 FROM agents WHERE location_id=$1 AND id=$2', [
-            location,
-            data.assignedTo,
-          ])
-        ).rowCount
-      )
-        throw new BadRequestException('Agent does not belong to this location');
-      await c.query(
-        'UPDATE conversations SET status=COALESCE($2,status),assigned_to=CASE WHEN $3 THEN $4 ELSE assigned_to END WHERE id=$1',
-        [
-          id,
-          data.status ?? null,
-          data.assignedTo !== undefined,
-          data.assignedTo ?? null,
-        ],
+      const message = await messages.save(
+        messages.create({
+          locationId: location,
+          conversationId,
+          providerMessageId: this.channels.allocateId(),
+          channel,
+          direction: 'outbound',
+          from: sender.value,
+          to: recipient.value,
+          body,
+          status: 'queued',
+          sentAt: new Date(),
+        }),
       );
-      const row = (await c.query(`${conversationSelect} WHERE id=$1`, [id]))
-        .rows[0];
-      await event(c, location, 'conversation.updated', row);
-      return row;
+      await manager.getRepository(SendJob).insert({
+        messageId: message.id,
+        nextAttemptAt: new Date(),
+      });
+      updateLastMessage(conversation, message);
+      await conversations.save(conversation);
+      const result = messageView(message);
+      await event(manager, location, 'message.new', {
+        message: result,
+        conversation: conversationView(conversation),
+      });
+      return result;
     });
   }
 
-  async listConversations(location: string, query: ConversationQueryDto) {
-    const status = query.status ?? null;
-    const assigned = query.assignedTo ?? null;
-    return this.snapshot(
-      location,
-      JSON.stringify(['conversations', status, assigned]),
-      query,
-      `${conversationSelect} WHERE location_id=$1 AND ($2::text IS NULL OR status=$2) AND ($3::text IS NULL OR assigned_to=$3) ORDER BY last_message_at DESC NULLS LAST,id DESC`,
-      [location, status, assigned],
-    );
-  }
-  async listMessages(location: string, id: string, query: PaginationDto) {
-    await this.db.transaction((c) => this.conversation(c, location, id));
-    return this.snapshot(
-      location,
-      JSON.stringify(['messages', id]),
-      query,
-      `${messageSelect} WHERE location_id=$1 AND conversation_id=$2 ORDER BY sent_at,id`,
-      [location, id],
-    );
+  async read(id: number) {
+    return this.db.ormTransaction(async (manager) => {
+      const conversations = manager.getRepository(ConversationEntity);
+      const found = await conversations.findOneBy({ id });
+      if (!found) throw new NotFoundException('Conversation not found');
+      const location = found.locationId;
+      await lockLocation(manager, location);
+      const conversation = await conversations.findOne({
+        where: { id, locationId: location },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!conversation) throw new NotFoundException('Conversation not found');
+      conversation.unreadCount = 0;
+      await conversations.save(conversation);
+      const result = conversationView(conversation);
+      await event(manager, location, 'conversation.updated', result);
+      return result;
+    });
   }
 
-  async search(location: string, query: SearchMessagesDto) {
+  async patch(id: number, data: UpdateConversationDto) {
+    return this.db.ormTransaction(async (manager) => {
+      const conversations = manager.getRepository(ConversationEntity);
+      const found = await conversations.findOneBy({ id });
+      if (!found) throw new NotFoundException('Conversation not found');
+      const location = found.locationId;
+      await lockLocation(manager, location);
+      const conversation = await conversations.findOne({
+        where: { id, locationId: location },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!conversation) throw new NotFoundException('Conversation not found');
+      if (
+        typeof data.assignedTo === 'number' &&
+        !(await manager.getRepository(Agent).existsBy({ id: data.assignedTo }))
+      )
+        throw new BadRequestException('Agent does not exist');
+      if (typeof data.assignedTo === 'number') {
+        await markAgentAssigned(manager, data.assignedTo);
+      }
+      if (data.status !== undefined) conversation.status = data.status;
+      if (data.assignedTo !== undefined)
+        conversation.assignedTo = data.assignedTo;
+      await conversations.save(conversation);
+      const result = conversationView(conversation);
+      await event(manager, location, 'conversation.updated', result);
+      return result;
+    });
+  }
+
+  async listConversations(locationName: string, query: ConversationQueryDto) {
+    const location = await this.resolveLocationId(locationName);
+    return this.db.ormTransaction(async (manager) => {
+      const conversations = manager
+        .getRepository(ConversationEntity)
+        .createQueryBuilder('conversation')
+        .where('conversation.locationId = :locationId', {
+          locationId: location,
+        });
+      if (query.status)
+        conversations.andWhere('conversation.status = :status', {
+          status: query.status,
+        });
+      if (query.assignedTo !== undefined)
+        conversations.andWhere('conversation.assignedTo = :assignedTo', {
+          assignedTo: query.assignedTo,
+        });
+      conversations
+        .orderBy('conversation.lastMessageAt', 'DESC', 'NULLS LAST')
+        .addOrderBy('conversation.id', 'DESC');
+
+      return this.snapshot(
+        manager,
+        location,
+        JSON.stringify([
+          'conversations',
+          query.status ?? null,
+          query.assignedTo ?? null,
+        ]),
+        query,
+        async () => {
+          const rows = await conversations.getMany();
+          const identities = await manager
+            .getRepository(ContactIdentity)
+            .findBy({ locationId: location });
+          const latestInboundMessages = await manager
+            .getRepository(Message)
+            .createQueryBuilder('message')
+            .distinctOn(['message.conversationId'])
+            .select([
+              'message.conversationId',
+              'message.channel',
+              'message.from',
+              'message.sentAt',
+              'message.id',
+            ])
+            .where('message.locationId = :locationId', {
+              locationId: location,
+            })
+            .andWhere('message.direction = :direction', {
+              direction: 'inbound',
+            })
+            .orderBy('message.conversationId', 'ASC')
+            .addOrderBy('message.sentAt', 'DESC')
+            .addOrderBy('message.id', 'DESC')
+            .getMany();
+          const lastMessageIds = rows.flatMap((conversation) =>
+            conversation.lastMessageId === null
+              ? []
+              : [conversation.lastMessageId],
+          );
+          const lastMessages = lastMessageIds.length
+            ? await manager.getRepository(Message).find({
+                where: { id: In(lastMessageIds) },
+                select: { id: true, channel: true },
+              })
+            : [];
+          const lastMessageChannels = new Map(
+            lastMessages.map((message) => [message.id, message.channel]),
+          );
+          const customerContactByConversation = new Map<number, number>();
+          const identityByKindAndValue = new Map(
+            identities.map((identity) => [
+              JSON.stringify([identity.kind, identity.value]),
+              identity.contactId,
+            ]),
+          );
+          for (const message of latestInboundMessages) {
+            const kind =
+              this.channels.get(message.channel).kind === 'email'
+                ? 'email'
+                : 'phone';
+            const customer = identityByKindAndValue.get(
+              JSON.stringify([kind, message.from]),
+            );
+            if (customer !== undefined)
+              customerContactByConversation.set(
+                message.conversationId,
+                customer,
+              );
+          }
+          return rows.map((conversation) => {
+            const contactId =
+              customerContactByConversation.get(conversation.id) ??
+              conversation.participantAId;
+            return {
+              conversationId: conversation.id,
+              contactId,
+              lastMessageChannel:
+                conversation.lastMessageId === null
+                  ? null
+                  : (lastMessageChannels.get(conversation.lastMessageId) ??
+                    null),
+              lastMessagePreview: conversation.lastMessagePreview,
+              lastMessageAt: conversation.lastMessageAt,
+              status: conversation.status,
+              assignedTo: conversation.assignedTo,
+              unreadCount: conversation.unreadCount,
+            };
+          });
+        },
+      );
+    }, 'REPEATABLE READ');
+  }
+  async listMessages(id: number, query: PaginationDto) {
+    return this.db.ormTransaction(async (manager) => {
+      const conversation = await manager
+        .getRepository(ConversationEntity)
+        .findOne({
+          where: { id },
+          select: { locationId: true },
+        });
+      if (!conversation) throw new NotFoundException('Conversation not found');
+      const messages = manager
+        .getRepository(Message)
+        .createQueryBuilder('message')
+        .select([
+          'message.id',
+          'message.conversationId',
+          'message.providerMessageId',
+          'message.channel',
+          'message.direction',
+          'message.from',
+          'message.to',
+          'message.body',
+          'message.status',
+          'message.sentAt',
+          'message.createdAt',
+        ])
+        .where('message.locationId = :locationId', {
+          locationId: conversation.locationId,
+        })
+        .andWhere('message.conversationId = :conversationId', {
+          conversationId: id,
+        })
+        .orderBy('message.sentAt', 'ASC')
+        .addOrderBy('message.id', 'ASC');
+      return this.snapshot(
+        manager,
+        conversation.locationId,
+        JSON.stringify(['messages', id]),
+        query,
+        async () => messages.getMany().then((rows) => rows.map(messageView)),
+      );
+    }, 'REPEATABLE READ');
+  }
+
+  async search(locationName: string, query: SearchMessagesDto) {
+    const location = await this.resolveLocationId(locationName);
     const q = query.q.trim();
-    return this.snapshot(
-      location,
-      JSON.stringify(['search', q]),
-      query,
-      `${messageSelect} WHERE location_id=$1 AND to_tsvector('simple',body) @@ websearch_to_tsquery('simple',$2) ORDER BY sent_at DESC,id DESC`,
-      [location, q],
-    );
+    return this.db.ormTransaction((manager) => {
+      const messages = manager
+        .getRepository(Message)
+        .createQueryBuilder('message')
+        .select([
+          'message.id',
+          'message.conversationId',
+          'message.providerMessageId',
+          'message.channel',
+          'message.direction',
+          'message.from',
+          'message.to',
+          'message.body',
+          'message.status',
+          'message.sentAt',
+          'message.createdAt',
+        ])
+        .where('message.locationId = :locationId', { locationId: location })
+        .andWhere(
+          "to_tsvector('simple', message.body) @@ websearch_to_tsquery('simple', :query)",
+          { query: q },
+        )
+        .orderBy('message.sentAt', 'DESC')
+        .addOrderBy('message.id', 'DESC');
+      return this.snapshot(
+        manager,
+        location,
+        JSON.stringify(['search', q]),
+        query,
+        async () => messages.getMany().then((rows) => rows.map(messageView)),
+      );
+    }, 'REPEATABLE READ');
   }
 
   private async snapshot(
-    location: string,
+    manager: EntityManager,
+    location: number,
     scope: string,
     query: PaginationDto,
-    sql: string,
-    params: unknown[],
+    loadItems: () => Promise<Record<string, unknown>[]>,
   ) {
     const limit = query.limit;
-    let id: string;
+    let id: number;
     let offset = 0;
     if (query.cursor !== undefined) {
       const [snapshotId, position] = query.cursor.split(':');
-      id = snapshotId;
+      id = Number(snapshotId);
       offset = Number(position);
     } else {
-      id = randomUUID();
-      // One SQL statement gives a consistent view of rows and their ordering.
-      await this.db.query(
-        `INSERT INTO pagination_snapshots(id,location_id,scope,items)
-        SELECT $${params.length + 1},$1,$${params.length + 2},COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) FROM (${sql}) t`,
-        [...params, id, scope],
+      const items = await loadItems();
+      const snapshot = await manager.getRepository(PaginationSnapshot).save(
+        manager.getRepository(PaginationSnapshot).create({
+          locationId: location,
+          scope,
+          items,
+        }),
       );
+      id = snapshot.id;
     }
-    const [snapshot] = await this.db.query<{ total: number; items: unknown[] }>(
-      `SELECT jsonb_array_length(items) AS total,
-      COALESCE((SELECT jsonb_agg(value ORDER BY ordinality) FROM jsonb_array_elements(items) WITH ORDINALITY WHERE ordinality>$4 AND ordinality<=$5), '[]'::jsonb) AS items
-      FROM pagination_snapshots WHERE id=$1 AND location_id=$2 AND scope=$3 AND expires_at>clock_timestamp()`,
-      [id, location, scope, offset, offset + limit],
-    );
+    const snapshot = await manager
+      .getRepository(PaginationSnapshot)
+      .createQueryBuilder('snapshot')
+      .where('snapshot.id = :id', { id })
+      .andWhere('snapshot.locationId = :locationId', { locationId: location })
+      .andWhere('snapshot.scope = :scope', { scope })
+      .andWhere('snapshot.expiresAt > clock_timestamp()')
+      .getOne();
     if (!snapshot)
       throw new GoneException(
         'Cursor expired or does not belong to this query',
       );
-    if (offset > snapshot.total)
+    if (offset > snapshot.items.length)
       throw new BadRequestException('Invalid cursor offset');
+    const items = snapshot.items.slice(offset, offset + limit);
     return {
-      items: snapshot.items,
+      items,
       nextCursor:
-        offset + limit < snapshot.total ? `${id}:${offset + limit}` : null,
+        offset + limit < snapshot.items.length
+          ? `${id}:${offset + limit}`
+          : null,
+      hasMore: offset + limit < snapshot.items.length,
     };
   }
 }

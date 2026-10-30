@@ -35,11 +35,13 @@ export function IsSnapshotCursor() {
     validator: {
       validate(value: unknown) {
         if (typeof value !== 'string') return false;
-        const match =
-          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:(\d+)$/.exec(
-            value,
-          );
-        return match !== null && Number.isSafeInteger(Number(match[1]));
+        const match = /^(\d+):(\d+)$/.exec(value);
+        return (
+          match !== null &&
+          Number.isSafeInteger(Number(match[1])) &&
+          Number(match[1]) <= 2147483647 &&
+          Number.isSafeInteger(Number(match[2]))
+        );
       },
       defaultMessage: () => '$property must be a valid snapshot cursor',
     },
