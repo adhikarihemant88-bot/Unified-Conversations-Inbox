@@ -43,7 +43,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
     response.status(status).json({
       status,
       message,
-      data: null
+      data: null,
     });
   }
 }

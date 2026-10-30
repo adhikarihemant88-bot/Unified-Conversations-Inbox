@@ -12,13 +12,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.DatabaseService = void 0;
 const common_1 = require("@nestjs/common");
 const pg_1 = require("pg");
+const database_url_1 = require("./database-url");
 let DatabaseService = class DatabaseService {
     pool;
     constructor() {
-        const connectionString = process.env.DATABASE_URL;
-        if (!connectionString) {
-            throw new Error('DATABASE_URL is required. Set the PostgreSQL connection string in .env before starting the server.');
-        }
+        const connectionString = (0, database_url_1.databaseUrl)(process.env.DATABASE_URL);
         this.pool = new pg_1.Pool({
             connectionString,
         });
@@ -26,6 +24,22 @@ let DatabaseService = class DatabaseService {
     async query(sql, params = []) {
         const result = await this.pool.query(sql, params);
         return result.rows;
+    }
+    async transaction(work) {
+        const client = await this.pool.connect();
+        try {
+            await client.query('BEGIN');
+            const result = await work(client);
+            await client.query('COMMIT');
+            return result;
+        }
+        catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+        }
+        finally {
+            client.release();
+        }
     }
     async onModuleDestroy() {
         await this.pool.end();

@@ -7,6 +7,8 @@ async function bootstrap() {
   if (existsSync('.env.local')) loadEnvFile('.env.local');
   if (existsSync('.env')) loadEnvFile('.env');
   const app = await NestFactory.create(AppModule);
+  if (!process.env.WEBHOOK_TOKEN) throw new Error('WEBHOOK_TOKEN is required');
+  app.enableShutdownHooks();
   await app.listen(process.env.PORT ?? 3000);
 }
 void bootstrap();

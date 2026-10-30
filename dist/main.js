@@ -10,6 +10,9 @@ async function bootstrap() {
     if ((0, node_fs_1.existsSync)('.env'))
         (0, node_process_1.loadEnvFile)('.env');
     const app = await core_1.NestFactory.create(app_module_1.AppModule);
+    if (!process.env.WEBHOOK_TOKEN)
+        throw new Error('WEBHOOK_TOKEN is required');
+    app.enableShutdownHooks();
     await app.listen(process.env.PORT ?? 3000);
 }
 void bootstrap();

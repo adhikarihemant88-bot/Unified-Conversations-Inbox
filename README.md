@@ -1,1 +1,216 @@
-# Unified-Conversations-Inbox
+# Unified Conversations Inbox
+
+NestJS + TypeScript + PostgreSQL backend for one customer conversation across SMS, WhatsApp and email. Includes mocked providers, concurrent webhook deduplication, durable send retries, monotonic delivery statuses, snapshot pagination, location-isolated SSE and full-text search. No real channel accounts are needed.
+
+## Run locally
+
+Requirements: Node.js 22.15+ and PostgreSQL 17+ (or Docker Compose). PostgreSQL is the only service required; Redis is not used.
+
+```sh
+npm ci
+cp .env.example .env.local
+docker compose up -d --wait db
+npm run db:migrate
+npm run db:seed
+npm run start:dev
+```
+
+Set a random `WEBHOOK_TOKEN` in `.env.local`. If using an existing PostgreSQL server, set `DATABASE_URL` there and omit the Docker step. Migrations change the database you explicitly configure; use a development database. Existing environment variables take precedence over `.env.local`, which takes precedence over `.env`. Your existing environment files are not modified by this project.
+
+`npm run db:migrate` is transactional, versioned and safe to repeat. `npm run db:seed` creates two demo locations and agents, and a customer at `loc_1` with linked phone `+919876543210` and email `customer@example.com`.
+
+| Demo agent | Location | Bearer token |
+| --- | --- | --- |
+| `agent_1` | `loc_1` | `demo-agent-1-token` |
+| `agent_2` | `loc_2` | `demo-agent-2-token` |
+
+These are development fixtures. Tokens are SHA-256 hashed in the database. For a deployment, provision random tokens and replace demo records. Business webhook payloads use a separate shared `X-Webhook-Token`; possession grants trusted provider access to all locations. In a real integration, verify provider signatures and derive location from the registered provider account.
+
+Production build:
+
+```sh
+npm run build
+npm run start:prod
+```
+
+The worker starts with the application. Set `WORKER_ENABLED=false` for an API-only process. Default port: 3000. `GET /health` checks database connectivity.
+
+## Source layout
+
+- [src/webhook/](./src/webhook/): inbound and status webhook controller/service, webhook authentication guard, provider status/locking helpers, and webhook DTOs.
+- [src/inbox/](./src/inbox/): conversation APIs, outbound sending/worker, pagination, search, real-time events and shared message/channel domain logic.
+- [src/common/](./src/common/): shared validation decorators and HTTP response/error handling.
+- [src/health.controller.ts](./src/health.controller.ts): database health endpoint.
+
+## API examples
+
+For every endpoint, all three channels, pagination, assignment variants and SSE replay, see [the complete cURL examples](./docs/curl-examples.md).
+
+All JSON responses use `{ "status": 200, "message": "Success", "data": ... }`. Validation errors use HTTP 400, unauthorized requests 401, cross-location routes 403, inaccessible conversations 404, conflicting provider IDs 409, and expired/incompatible pagination cursors 410. Unexpected errors return a generic HTTP 500 response; details stay in server logs. SSE uses standard event-stream framing.
+
+Request bodies, path parameters and pagination/filter/search queries use class-based [inbox DTOs](./src/inbox/dto/) and [webhook DTOs](./src/webhook/dto/). A global `ValidationPipe` is registered through `APP_PIPE` in [AppModule](./src/app.module.ts), so production and integration tests use identical validation. It transforms DTO instances, rejects unknown fields and validates required nonblank strings, enums, UUIDs, calendar timestamps and cursors. Strings have no arbitrary DTO length limits. Query limits explicitly convert decimal strings to integers between 1 and 100; implicit coercion is disabled. On patches, omitted fields preserve existing values, `assignedTo: null` unassigns, and empty updates or `status: null` are rejected. Phone/email normalization, authorization, status progression and transaction invariants stay in services/database constraints.
+
+Inbound webhook:
+
+```sh
+curl -X POST http://localhost:3000/webhooks/inbound \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Token: replace-with-a-long-random-secret' \
+  -d '{"providerMessageId":"SM_abc123","locationId":"loc_1","channel":"sms","from":"+91 98765 43210","to":"+91 80000 00000","body":"Is the offer still valid?","sentAt":"2026-10-28T10:15:00Z"}'
+```
+
+The first response contains `{ duplicate: false, message }`. Reusing a `providerMessageId` returns HTTP 409 (`Duplicate providerMessageId`), with no second stored message, counter increment, reopening or event.
+
+List conversations:
+
+```sh
+curl 'http://localhost:3000/locations/loc_1/conversations?limit=25&status=open&assignedTo=agent_1' \
+  -H 'Authorization: Bearer demo-agent-1-token'
+```
+
+Filters are optional. Omit both to list all conversations. The page is `data: { items, nextCursor }`. Use `items[0].id` as the conversation ID for the following requests. It is a UUID generated by this application, distinct from `providerMessageId`.
+
+```sh
+# Replace CONVERSATION_ID with a returned UUID.
+curl 'http://localhost:3000/conversations/CONVERSATION_ID/messages?limit=25' \
+  -H 'Authorization: Bearer demo-agent-1-token'
+
+curl -X POST http://localhost:3000/conversations/CONVERSATION_ID/messages \
+  -H 'Authorization: Bearer demo-agent-1-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"channel":"whatsapp","body":"Yes, valid till Friday!"}'
+
+curl -X POST http://localhost:3000/conversations/CONVERSATION_ID/read \
+  -H 'Authorization: Bearer demo-agent-1-token'
+
+curl -X PATCH http://localhost:3000/conversations/CONVERSATION_ID \
+  -H 'Authorization: Bearer demo-agent-1-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"closed","assignedTo":"agent_1"}'
+```
+
+Outbound requests return HTTP 202 and the persisted `queued` message. Set `assignedTo` to `null` to unassign. Sending through a channel without a matching contact identity returns 400. The business sender is taken from the latest inbound message on that channel, with mock defaults of `+918000000000` or `inbox@example.com`.
+
+Delivery callback (use the outbound response's `providerMessageId`):
+
+```sh
+curl -X POST http://localhost:3000/webhooks/status \
+  -H 'Content-Type: application/json' \
+  -H 'X-Webhook-Token: replace-with-a-long-random-secret' \
+  -d '{"providerMessageId":"mock_REPLACE_WITH_RETURNED_ID","status":"delivered","timestamp":"2026-10-28T10:16:00Z"}'
+```
+
+The mock send operation advances status to `sent` on success. Delivery and read acknowledgments are simulated through the status endpoint. An agent marking a conversation read resets its unread count; it does not fabricate a channel delivery/read receipt.
+
+Real-time subscription:
+
+```sh
+curl -N http://localhost:3000/locations/loc_1/events \
+  -H 'Authorization: Bearer demo-agent-1-token'
+```
+
+Events: `message.new` (message and updated conversation), `message.status` (updated message), and `conversation.updated`. Reconnect with `Last-Event-ID: <last received event ID>` to replay later events. Without that header, the stream starts at the current location watermark. Use authenticated `fetch` streaming or an SSE client that supports headers; native browser `EventSource` does not allow a custom Authorization header.
+
+Search (optional bonus implemented):
+
+```sh
+curl 'http://localhost:3000/locations/loc_1/messages/search?q=offer&limit=25' \
+  -H 'Authorization: Bearer demo-agent-1-token'
+```
+
+Search uses PostgreSQL full-text matching with the `simple` dictionary, newest first. It supports snapshot cursors too. This is token matching, not arbitrary substring/fuzzy search.
+
+## Data model and indexes
+
+The schema is defined in [db/001_init.sql](./db/001_init.sql).
+
+| Table | Purpose / guarantees |
+| --- | --- |
+| `locations`, `agents` | Location ownership, unique hashed bearer tokens; assignment must reference an agent in the same location. |
+| `contacts` | Canonical customer within one location. |
+| `contact_identities` | Unique `(location_id, kind, value)`; phone/email identities reference the same contact explicitly. |
+| `conversations` | Unique `(location_id, contact_id)`; nonnegative unread count; open/closed status. |
+| `messages` | Unique `provider_message_id`; checked channel/direction/status; composite location/conversation foreign key. |
+| `provider_states` | Best known status, including callbacks received before message persistence. |
+| `send_jobs` | Persistent attempts, pending/done state, and retry schedule. |
+| `inbox_events` | Transactional event log for location-filtered replay. |
+| `pagination_snapshots` | Location/query-scoped ordered result snapshots, expiring after 15 minutes. |
+
+Indexes cover conversation listing by location/latest activity, status/assignment filters, contact identity lookup, chronological message history, due pending jobs, location/event ID polling, snapshot expiry, and GIN full-text search. Primary and unique constraints supply the supporting identity/idempotency indexes. Composite foreign keys prevent accidental cross-location references even in direct SQL writes.
+
+Phone input must include a country code; spaces, parentheses, dots, hyphens and a `whatsapp:` prefix are normalized. Email is trimmed and lowercased. We do not guess a country code or infer that an unlinked email and phone belong to one person. The demo seed links both identities; unknown senders create separate contacts until explicitly linked. A contact management/merge API is outside the assignment scope.
+
+## Concurrency and ordering
+
+### Inbound idempotency and counters
+
+Each ingestion is one transaction on one checked-out connection. A PostgreSQL transaction advisory lock serializes the provider ID, including its first use. The unique message constraint is the final integrity boundary. Known identities skip the identity-creation lock. On an identity miss, a lock plus a fresh lookup serializes first-contact creation; a CTE inserts the contact and identity together only if still absent.
+
+The normal path uses five database calls inside the transaction (seven for a new identity), plus `BEGIN`/`COMMIT`: provider lock; combined duplicate/location/identity/pending-status lookup; conversation upsert; message insertion; and event insertion. The conversation upsert atomically creates or increments unread count, reopens the thread and conditionally updates its preview. Its row lock serializes concurrent channels and mark-as-read. Both writes use `RETURNING` for response/event data, avoiding follow-up reads. Event lock acquisition and insertion share one statement, with the lock taken before event-ID allocation.
+
+The provider lock and the lookup deliberately remain separate statements. With PostgreSQL READ COMMITTED, the lookup must take a new snapshot after any wait on that lock; folding a waiting lock and correctness-sensitive reads into one statement can use a stale snapshot. Identity creation follows the same rule. Query-count reductions lower network round trips; actual throughput still depends on database latency and hot-conversation/location contention.
+
+Only a successfully committed new inbound message increments unread count. The conversation upsert runs before message insertion; any subsequent insertion/event failure rolls back the increment, reopening and preview together. Old `sentAt` values cannot replace newer preview/activity metadata; UUIDs break equal-time ties. Mark-as-read locks the same conversation row. Messages ordered before that reset are read; messages ordered after it stay unread. This defines the outcome of concurrent read/ingestion requests without lost increments.
+
+### Status ordering and early callbacks
+
+The ordering is `queued < sent < delivered < read < failed`. `failed` is terminal, as the brief allows failure at any point. Timestamp is retained as provider metadata, not used to regress lifecycle state. Late `sent` after `delivered`, duplicate callbacks, and worker completion after a callback cannot lower status.
+
+Both callback and ingestion paths hold the same provider-ID transaction lock. A callback with no corresponding message persists in `provider_states`; ingestion reconciles it while holding that lock. There is no separate check/insert window in which an early callback can be stranded. Inbound messages begin as `delivered` unless an earlier callback already establishes a later state.
+
+Provider IDs are assumed globally unique because the specified status payload contains no channel or location. Real providers with overlapping ID namespaces require a provider/account identifier in the callback contract and composite deduplication keys.
+
+### Outbound queue and retries
+
+Outbound message, send job, preview and event commit together. The worker claims jobs with `FOR UPDATE SKIP LOCKED`, so multiple workers cannot process a job simultaneously. The mock receives a stable, preallocated provider ID, fails with probability `MOCK_FAILURE_RATE` (default 0.2), and makes at most three total attempts. Backoff is `RETRY_BASE_MS`, then twice that (defaults: 1s and 2s). Only exhaustion marks the message failed.
+
+Pending work and attempt counts survive application restarts. The mock runs while the job transaction is held; this keeps the exercise small. A real slow provider should use leased jobs, request timeouts, and provider-side idempotency using the stable ID. A crash between an external send and database commit can otherwise repeat the external action; database transactions cannot provide exactly-once delivery to a remote service.
+
+### Stable pagination
+
+A cursor contains a random snapshot UUID and next position. The first request materializes an ordered result in one database statement. Later requests page through that frozen result; snapshots are bound to location, resource and filters. Page size is 1–100 (default 25). Snapshots expire in 15 minutes; restart listing after HTTP 410.
+
+Messages use `(sent_at,id)` ordering; conversations use `(last_message_at,id)` descending. A simple live keyset is insufficient for conversations because a new message moves an existing conversation ahead of the cursor. Frozen snapshots prevent both skipped rows and duplicates, including late messages with older timestamps. Messages/events arriving after snapshot creation appear through SSE and a fresh listing; statuses/counters in existing snapshots remain frozen too.
+
+Trade-off: snapshot creation stores the entire result and scales with inbox/history size. Worker housekeeping deletes expired snapshots roughly every minute when idle (less frequently under load). For large histories, use versioned ordering or an external snapshot cache, quotas and explicit pagination sessions.
+
+### Location-isolated real-time updates
+
+Bearer authentication derives location from the agent record. Every data lookup and event poll is location scoped; conversation IDs alone never grant access. Events are stored in the same transaction as their state change, so no uncommitted/rolled-back state is published.
+
+SSE polls the shared event log every 500ms and replays by event ID. Event allocation is serialized per location until commit: an earlier uncommitted event ID cannot later appear behind a location's delivered watermark. Heartbeats run about every 15 seconds. Slow consumers disconnect and can resume with `Last-Event-ID`. Shutdown closes streams. Multiple API instances can use this shared database log without sticky sessions or an in-memory broker.
+
+## Tests
+
+```sh
+npm test -- --runInBand  # domain and normalization tests
+npm run test:e2e         # actual PostgreSQL + HTTP + SSE integration tests
+npm run check           # build, type-aware lint, unit tests, integration tests
+```
+
+Integration tests automatically start and stop a disposable local PostgreSQL binary using the pinned development-only `embedded-postgres` dependency. They never read application `.env` credentials. For environments where native binaries cannot run (including root-only containers), provide an explicit disposable server:
+
+```sh
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/inbox_test npm run test:e2e
+```
+
+The suite creates a random private schema, runs migrations there, and removes only that schema afterward. Database permissions must permit schema creation. No existing application tables are truncated. If your package manager disables dependency postinstall scripts, enable the platform package's hydration script or use `TEST_DATABASE_URL`.
+
+Coverage includes concurrent duplicates, 50 simultaneous first messages, cross-channel identities, early/reordered/terminal statuses, read/reset races, reopening, late-message previews, snapshots under insertion/reordering, outbound parallel claims/backoff/exhaustion/recovery, transaction rollback, database-level tenant constraints, HTTP authorization and live SSE isolation/replay.
+
+## Trade-offs and improvements
+
+- Static seeded bearer credentials keep authentication testable; production needs credential lifecycle, agent authorization policy and provider signatures.
+- Database locks favor correctness for this workload. Advisory hash collisions only reduce concurrency; they do not weaken uniqueness constraints.
+- Events and orphan provider states currently have no automatic retention policy. Add retention, replay-expiry responses, monitoring and storage quotas before sustained production traffic.
+- Outbound request retries can create multiple queued messages; client request idempotency keys would prevent that. Required webhook idempotency is implemented.
+- Providers are mocked. Attachment support, contact merges, message edits/deletes and agent presence/typing are omitted. Presence/typing is an optional bonus.
+- Add rate limits, pagination resource quotas, structured redacted logs, metrics, database backups, connection budgets and production deployment configuration.
+
+### Design note: 10,000 inbound messages/second
+
+Partition ingestion by location/contact to preserve per-conversation ordering while processing unrelated conversations in parallel. Acknowledge only after durable acceptance (database commit or a durable broker). Batch writes, partition large message/event tables, tune indexes and connection pools, and enforce provider deduplication on the durable write path. A single hot conversation still requires serialized counter/order updates; tenant partitioning alone cannot remove that contention.
+
+Replace per-connection database polling with event-log/outbox consumers and a broker partitioned by location. Dedicated SSE gateways authenticate location subscriptions and fan out committed events across instances. Retain durable event IDs for reconnect/replay and monitor lag/backpressure. Leased outbound jobs allow slow network calls outside transactions; provider idempotency handles the send/commit crash window. Replace full-result JSON snapshots with bounded/versioned pagination sessions and cache suitable inbox projections.
+
+See [AI_USAGE.md](./AI_USAGE.md) for the AI-assisted workflow and a real regression caught and fixed during implementation.

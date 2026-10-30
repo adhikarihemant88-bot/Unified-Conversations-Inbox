@@ -37,7 +37,7 @@ let HttpExceptionFilter = HttpExceptionFilter_1 = class HttpExceptionFilter {
         response.status(status).json({
             status,
             message,
-            data: null
+            data: null,
         });
     }
 };
