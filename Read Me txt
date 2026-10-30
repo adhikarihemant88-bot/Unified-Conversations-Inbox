@@ -1,0 +1,21 @@
+Read Me txt
+parking Lot :
+Sneha :
+    ----API---
+    -arch for a parking lot
+    -parking /car/bike/feature
+    -parking lot dashboard screen for each type of vehicle
+    -multiple level parking lot --- floors
+    -singleton pattern parking lot
+
+Hemant :
+    -arch for a parking lot
+    -parking lot dashboard screen
+    -multiple level parking lot
+    -singleton pattern parking lot
+
+
+-combine
+    -end POINT 
+    --connect to postman
+--nest
