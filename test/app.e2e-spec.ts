@@ -108,6 +108,7 @@ describe('Inbox (real PostgreSQL)', () => {
     process.env.WEBHOOK_TOKEN = 'test-webhook';
     process.env.ADMIN_TOKEN = 'test-admin';
     process.env.INBOX_TOKEN = 'test-inbox';
+    process.env.INBOX_LOCATION_TOKENS = 'loc_1:test-loc1,loc_2:test-loc2';
     process.env.WORKER_ENABLED = 'false';
     process.env.MOCK_FAILURE_RATE = '0';
     const module = await Test.createTestingModule({
@@ -214,8 +215,13 @@ describe('Inbox (real PostgreSQL)', () => {
           .send(body),
       ),
     );
-    expect(responses.filter((r) => r.status === 200)).toHaveLength(1);
-    expect(responses.filter((r) => r.status === 409)).toHaveLength(29);
+    expect(responses.every((r) => r.status === 200)).toBe(true);
+    expect(
+      responses.filter((r) => r.body.data.duplicate === false),
+    ).toHaveLength(1);
+    expect(
+      responses.filter((r) => r.body.data.duplicate === true),
+    ).toHaveLength(29);
     expect((await list()).body.data[0].unreadCount).toBe(1);
     expect(await db.getRepository(Message).count()).toBe(1);
     expect(await db.getRepository(InboxEvent).count()).toBe(1);
@@ -712,7 +718,7 @@ describe('Inbox (real PostgreSQL)', () => {
       .set(auth)
       .send({ status: 'closed', assignedTo: agentOneId })
       .expect(200);
-    await inbound(body, 409);
+    expect((await inbound(body)).body.data.duplicate).toBe(true);
     expect((await list()).body.data[0].status).toBe('closed');
     await inbound();
     expect((await list()).body.data[0].status).toBe('open');
@@ -1115,6 +1121,169 @@ describe('Inbox (real PostgreSQL)', () => {
       clearTimeout(timeout);
       abort.abort();
     }
+  });
+  it('50 parallel inbound messages to one conversation give unreadCount 50', async () => {
+    await inbound(payload());
+    await Promise.all(
+      Array.from({ length: 49 }, () =>
+        request(app.getHttpServer())
+          .post('/webhooks/inbound')
+          .set(webhook)
+          .send(payload())
+          .expect(200),
+      ),
+    );
+    const conversations = (await list()).body.data;
+    expect(conversations).toHaveLength(1);
+    expect(conversations[0].unreadCount).toBe(50);
+    expect(await db.getRepository(Message).count()).toBe(50);
+  });
+  it('replayed identical webhook is acknowledged once without side effects', async () => {
+    const body = payload();
+    const first = await inbound(body);
+    expect(first.body.data.duplicate).toBe(false);
+    const again = await inbound(body);
+    expect(again.body.data.duplicate).toBe(true);
+    expect(again.body.data.message.id).toBe(first.body.data.message.id);
+    expect(await db.getRepository(InboxEvent).count()).toBe(1);
+    expect((await list()).body.data[0].unreadCount).toBe(1);
+  });
+  it('location-scoped tokens cannot read, write or stream another location', async () => {
+    const m = (await inbound()).body.data.message;
+    const loc1 = { Authorization: 'Bearer test-loc1' };
+    const loc2 = { Authorization: 'Bearer test-loc2' };
+    const http = () => request(app.getHttpServer());
+    await http().get('/locations/loc_1/conversations').set(loc1).expect(200);
+    await http().get('/locations/loc_1/conversations').set(loc2).expect(403);
+    await http().get('/locations/loc_1/events').set(loc2).expect(403);
+    await http()
+      .get('/locations/loc_1/messages/search?q=Hello')
+      .set(loc2)
+      .expect(403);
+    await http()
+      .get(`/conversations/${m.conversationId}/messages`)
+      .set(loc1)
+      .expect(200);
+    for (const req of [
+      http().get(`/conversations/${m.conversationId}/messages`),
+      http().post(`/conversations/${m.conversationId}/read`),
+      http()
+        .patch(`/conversations/${m.conversationId}`)
+        .send({ status: 'closed' }),
+      http()
+        .post(`/conversations/${m.conversationId}/messages`)
+        .send({ channel: 'sms', body: 'x' }),
+    ])
+      await req.set(loc2).expect(403);
+    await http().get('/conversations/999999/messages').set(loc2).expect(404);
+    await http()
+      .get('/locations/loc_1/conversations')
+      .set({ Authorization: 'Bearer nope' })
+      .expect(401);
+    await http().get('/locations/loc_2/conversations').set(auth).expect(200);
+    await http().get('/locations/loc_1/conversations').set(webhook).expect(401);
+  });
+  it('streams typing and presence only to the same location', async () => {
+    const m = (await inbound()).body.data.message;
+    const read = async (
+      path: string,
+      until: string[],
+      abort: AbortController,
+    ) => {
+      const response = await fetch(`${base}${path}`, {
+        headers: auth,
+        signal: abort.signal,
+      });
+      const reader = response.body!.getReader();
+      let content = '';
+      return {
+        wait: async () => {
+          while (!until.every((u) => content.includes(u))) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            content += new TextDecoder().decode(chunk.value);
+          }
+          return content;
+        },
+        text: () => content,
+      };
+    };
+    const own = new AbortController();
+    const foreign = new AbortController();
+    const watcher = new AbortController();
+    const timer = setTimeout(() => {
+      own.abort();
+      foreign.abort();
+      watcher.abort();
+    }, 8000);
+    try {
+      const ownStream = await read(
+        '/locations/loc_1/events',
+        ['"typing":true', 'presence.online'],
+        own,
+      );
+      const foreignStream = await read(
+        `/locations/loc_2/events?agentId=${agentTwoId}`,
+        [],
+        foreign,
+      );
+      // Another agent connects at loc_1 and is announced to the first stream.
+      await read(
+        `/locations/loc_1/events?agentId=${agentOneId}`,
+        ['presence.snapshot'],
+        watcher,
+      ).then((s) => s.wait());
+      await request(app.getHttpServer())
+        .post('/locations/loc_1/typing')
+        .set(auth)
+        .send({
+          conversationId: m.conversationId,
+          agentId: agentOneId,
+          typing: true,
+        })
+        .expect(202);
+      const content = await ownStream.wait();
+      expect(content).toContain('event: typing');
+      expect(content).toContain(`"agentId":${agentOneId}`);
+      expect(content).not.toMatch(/^id: /m);
+      expect(foreignStream.text()).not.toContain('typing');
+      expect(foreignStream.text()).not.toContain(`"agentId":${agentOneId}`);
+      const presence = await request(app.getHttpServer())
+        .get('/locations/loc_1/presence')
+        .set(auth)
+        .expect(200);
+      expect(presence.body.data.agentIds).toEqual([agentOneId]);
+      // Typing for a conversation that belongs to another location is rejected.
+      await request(app.getHttpServer())
+        .post('/locations/loc_2/typing')
+        .set(auth)
+        .send({
+          conversationId: m.conversationId,
+          agentId: agentOneId,
+          typing: true,
+        })
+        .expect(404);
+      await request(app.getHttpServer())
+        .post('/locations/loc_1/typing')
+        .set(auth)
+        .send({
+          conversationId: m.conversationId,
+          agentId: 999999,
+          typing: true,
+        })
+        .expect(400);
+    } finally {
+      clearTimeout(timer);
+      own.abort();
+      foreign.abort();
+      watcher.abort();
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    const after = await request(app.getHttpServer())
+      .get('/locations/loc_1/presence')
+      .set(auth)
+      .expect(200);
+    expect(after.body.data.agentIds).toEqual([]);
   });
   it('validates malformed channels, dates, phone numbers, bodies, IDs and limits', async () => {
     for (const extra of [

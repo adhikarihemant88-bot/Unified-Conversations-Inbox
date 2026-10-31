@@ -23,3 +23,9 @@ The correction validates exact timestamp components, leap years, month/day range
 Domain tests cover validation and normalization; integration tests run actual PostgreSQL, parallel HTTP requests and SSE streams. They exercise database constraints/locks instead of pretending an in-memory mock proves concurrency. Provider failures and retry recovery are deterministic in tests, while normal application mock sends fail randomly at the configured probability.
 
 Code and README document assumptions that the brief leaves open: explicit phone/email linking, globally unique provider IDs, terminal failures, read/reset ordering, and frozen pagination semantics. The implementation should be reviewed and understood before submission, including the external-send crash window and snapshot storage cost.
+
+## Limitation: DTO implementation needed manual correction
+
+AI-generated DTO implementations did not consistently follow the intended API contract. Some suggestions imposed arbitrary hard length limits or added validation checks that were not required, while others introduced extra fields or data beyond what the API needed. These choices could reject otherwise valid input or make the request/response contract unnecessarily complicated.
+
+The DTOs were reviewed and adjusted to validate the actual requirements: required nonblank values, supported enums, valid timestamps, integer IDs and pagination bounds, while rejecting unknown request fields. Arbitrary string-length limits and unnecessary fields were removed. This is a limitation of the AI-assisted implementation process: generated DTOs need to be checked against the requirements and tests rather than accepted without review.

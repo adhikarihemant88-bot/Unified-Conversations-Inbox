@@ -14,6 +14,8 @@ import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
 import { SendJob } from '../entities/send-job.entity';
 import { DatabaseService } from '../utils/database.service';
 import { Channels } from './channels';
+import { EventsService } from './events.service';
+import type { TypingDto } from './dto/typing.dto';
 import type { SendMessageDto } from './dto/send-message.dto';
 import type { UpdateConversationDto } from './dto/update-conversation.dto';
 import type {
@@ -35,6 +37,7 @@ export class InboxService {
   constructor(
     private readonly db: DatabaseService,
     private readonly channels: Channels,
+    private readonly events: EventsService,
   ) {}
 
   async resolveLocationId(name: string): Promise<number> {
@@ -43,6 +46,27 @@ export class InboxService {
     );
     if (!location) throw new NotFoundException('Location not found');
     return location.id;
+  }
+
+  async typing(locationName: string, data: TypingDto) {
+    const location = await this.resolveLocationId(locationName);
+    const conversation = await this.db
+      .getRepository(ConversationEntity)
+      .findOneBy({ id: data.conversationId, locationId: location });
+    if (!conversation) throw new NotFoundException('Conversation not found');
+    if (!(await this.db.getRepository(Agent).existsBy({ id: data.agentId })))
+      throw new BadRequestException('Agent does not exist');
+    this.events.publish(location, 'typing', {
+      conversationId: data.conversationId,
+      agentId: data.agentId,
+      typing: data.typing,
+    });
+    return { accepted: true };
+  }
+
+  async presence(locationName: string) {
+    const location = await this.resolveLocationId(locationName);
+    return { agentIds: this.events.onlineAgents(location) };
   }
 
   async send(conversationId: number, data: SendMessageDto) {

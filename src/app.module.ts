@@ -1,6 +1,7 @@
 import { APP_FILTER, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { HttpExceptionFilter } from './common/http-exception.filter';
 import { BearerAuthGuard } from './common/bearer-auth';
+import { LocationScopeGuard } from './common/location-scope.guard';
 import { SuccessInterceptor } from './common/success.interceptor';
 import { Module, ValidationPipe } from '@nestjs/common';
 import { DatabaseService } from './utils/database.service';
@@ -26,6 +27,7 @@ import { HealthController } from './health.controller';
     DatabaseService,
     Channels,
     BearerAuthGuard,
+    LocationScopeGuard,
     InboxService,
     WebhookService,
     EventsService,

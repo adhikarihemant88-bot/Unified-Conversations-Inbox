@@ -13,6 +13,9 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { BearerAuthGuard, UseBearerToken } from '../common/bearer-auth';
+import { LocationScopeGuard } from '../common/location-scope.guard';
+import { TypingDto } from './dto/typing.dto';
+import { EventsQueryDto } from './dto/events-query.dto';
 import { InboxService } from './inbox.service';
 import { EventsService } from './events.service';
 import { SendMessageDto } from './dto/send-message.dto';
@@ -28,7 +31,7 @@ import {
 } from './dto/route-params.dto';
 @Controller()
 @UseBearerToken('INBOX_TOKEN')
-@UseGuards(BearerAuthGuard)
+@UseGuards(BearerAuthGuard, LocationScopeGuard)
 export class InboxController {
   constructor(
     private readonly inbox: InboxService,
@@ -39,8 +42,10 @@ export class InboxController {
     @Param() params: LocationParamsDto,
     @Query() query: ConversationQueryDto,
   ) {
-    const { items, nextCursor, hasMore } =
-      await this.inbox.listConversations(params.locationId, query);
+    const { items, nextCursor, hasMore } = await this.inbox.listConversations(
+      params.locationId,
+      query,
+    );
     return { message: 'Success', data: items, nextCursor, hasMore };
   }
 
@@ -83,10 +88,22 @@ export class InboxController {
   @Get('locations/:locationId/events')
   async eventsStream(
     @Param() params: LocationParamsDto,
+    @Query() query: EventsQueryDto,
     @Headers('last-event-id') last: unknown,
     @Res() res: Response,
   ) {
     const locationId = await this.inbox.resolveLocationId(params.locationId);
-    return this.events.open(locationId, last, res);
+    return this.events.open(locationId, last, res, query.agentId);
+  }
+
+  @Post('locations/:locationId/typing')
+  @HttpCode(202)
+  typing(@Param() params: LocationParamsDto, @Body() body: TypingDto) {
+    return this.inbox.typing(params.locationId, body);
+  }
+
+  @Get('locations/:locationId/presence')
+  presence(@Param() params: LocationParamsDto) {
+    return this.inbox.presence(params.locationId);
   }
 }

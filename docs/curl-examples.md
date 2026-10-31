@@ -38,7 +38,7 @@ curl -sS "$BASE_URL/health"
 
 ## 3. Receive an inbound message
 
-`POST /webhooks/inbound` — HTTP 200 for a new message. Each example uses a different provider ID; reuse returns HTTP 409 without adding another message or unread increment.
+`POST /webhooks/inbound` — HTTP 200 for a new message. Each example uses a different provider ID; replaying the same payload returns HTTP 200 with `duplicate: true` and adds no message or unread increment; reusing the ID with a different payload returns HTTP 409.
 
 ### SMS
 
