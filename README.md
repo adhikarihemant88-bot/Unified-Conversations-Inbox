@@ -2,88 +2,35 @@
 
 NestJS + TypeScript + PostgreSQL backend for one conversation per participant pair per location across SMS, WhatsApp and email. Messages in either direction share the same conversation. Includes mocked providers, concurrent webhook deduplication, durable send retries, monotonic delivery statuses, snapshot pagination, location-isolated SSE and full-text search. No real channel accounts are needed.
 
-## Run locally (beginner setup)
+## Run locally
 
-### What you need
-
-- Node.js 22.15 or newer and npm. Use Node.js 24.9 or newer to run the Jest test suites.
-- Docker Desktop with Docker Compose, or your own PostgreSQL 17+ database.
-- A terminal opened in this repository's folder.
-
-### 1. Install the project
-
-If you have not cloned the project yet, run the following command. If you already have the project, skip the clone command and open Terminal in its folder:
+Requirements: Node.js 22.15+ (Node 24.9+ to run the Jest suites, which load ESM-only NestJS packages) and PostgreSQL 17+ (or Docker Compose). PostgreSQL is the only service required; Redis is not used.
 
 ```sh
-git clone https://github.com/adhikarihemant88-bot/Unified-Conversations-Inbox.git
-cd Unified-Conversations-Inbox
-npm ci
-```
-
-### 2. Create local configuration
-
-Copy the example configuration:
-
-```sh
+npm i
 cp .env.example .env.local
-```
-
-Open `.env.local` in a text editor. For Docker-based local setup, keep its example `DATABASE_URL`. Set different random values for `INBOX_TOKEN`, `WEBHOOK_TOKEN`, and `ADMIN_TOKEN`; for example, run `openssl rand -hex 32` three times and paste each result into a different setting. Do not commit or share real credentials.
-
-### 3. Start the database
-
-Start Docker Desktop, wait until it is ready, then run:
-
-```sh
 docker compose up -d --wait db
-```
-
-If you already have a PostgreSQL 17+ server, put its connection URL in `.env.local` as `DATABASE_URL` and skip Docker. Use a development database because migrations create and change tables in the configured database. PostgreSQL is the only service required; Redis is not used.
-
-### 4. Build, create the schema, and add demo data
-
-Run these commands in order:
-
-```sh
-npm run build
 npm run db:migrate
 npm run db:seed
-```
-
-The build is needed because the seed script loads compiled application entities. The migration is safe to repeat and creates the schema for a fresh database. An older schema requires a separate data migration. The seed creates `loc_1` and `loc_2`, two global agents, and two linked demo participants at `loc_1`:
-
-- Participant A: `+919876543210` / `customer@example.com`
-- Participant B: `+918000000000` / `inbox@example.com`
-
-The seed prints the generated integer IDs for `agent_1` and `agent_2`; use one of those values when setting `AGENT_ID` in the API examples.
-
-### 5. Start the API
-
-```sh
 npm run start:dev
 ```
 
-Keep this terminal open while using the API. It runs at `http://localhost:3000`; check `http://localhost:3000/health` in a browser to verify that the server and database are reachable. Press Ctrl+C to stop the server.
-
-### Troubleshooting
-
-- If Docker is unavailable, start Docker Desktop and retry the database command.
-- If port 5432 is already in use, stop the other database or change the Docker port and `DATABASE_URL` to match.
-- If a database command fails, check that PostgreSQL is running and `DATABASE_URL` is correct.
-- If a request returns 401, check that the correct token is in `.env.local` and that the request uses `Authorization: Bearer <token>`.
-- If seeding fails because compiled entities are missing, run `npm run build`.
-
-### Common commands
-
-```sh
-npm run build
-npm run start:prod
-npm test -- --runInBand
-npm run test:e2e
-npm run check
+.env file:
 ```
-
-## Database and runtime details
+DATABASE_URL=postgresql://postgres.hlkdwkvcquzsawqlnfit:HcZ%407%26%2F4Stv4mcZ@aws-1-eu-central-1.pooler.supabase.com:5432/postgres
+WEBHOOK_TOKEN=WEBHOOK_TOKEN
+PORT=3000
+WORKER_ENABLED=true
+MOCK_FAILURE_RATE=0.2
+RETRY_BASE_MS=1000
+INBOX_TOKEN=INBOX_TOKEN
+ADMIN_TOKEN=ADMIN_TOKEN
+```
+for local create the .env file on the root of service and 
+```
+npm i
+npm run start:dev
+```
 
 Set distinct random `INBOX_TOKEN`, `WEBHOOK_TOKEN`, and `ADMIN_TOKEN` values in `.env.local`, and optionally `INBOX_LOCATION_TOKENS` for per-location agent credentials. Every protected endpoint uses `Authorization: Bearer <token>`; each API group accepts only its matching environment token. The inbox token authenticates inbox requests, while location is taken from each endpoint's path/body or resolved from its conversation ID. If using an existing PostgreSQL server, set `DATABASE_URL` there and omit the Docker step. Migrations change the database you explicitly configure; use a development database. Existing environment variables take precedence over `.env.local`, which takes precedence over `.env`. Your existing environment files are not modified by this project.
 
@@ -112,7 +59,7 @@ The worker starts with the application. Set `WORKER_ENABLED=false` for an API-on
 
 ## API examples
 
-The following walkthrough includes common requests. The [complete cURL reference](#complete-curl-reference) below includes every endpoint, all channels, pagination, assignment options, and SSE replay.
+For every endpoint, all three channels, pagination, assignment variants and SSE replay, see [the complete cURL examples](./docs/curl-examples.md).
 
 Create a global agent with `POST /admin/agents`, using the configured `ADMIN_TOKEN` as a bearer token. Send `{ "name": "Agent name" }`; the response includes the generated integer ID and name. Agent names are unique case-insensitively after trimming; an existing name returns HTTP 409 without creating another agent.
 
@@ -125,7 +72,7 @@ Inbound webhook:
 ```sh
 curl -X POST http://localhost:3000/webhooks/inbound \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer WEBHOOK_TOKEN' \
+  -H 'Authorization: Bearer $WEBHOOK_TOKEN' \
   -d '{"providerMessageId":"SM_abc123","locationId":"loc_1","channel":"sms","from":"+91 98765 43210","to":"+91 80000 00000","body":"Is the offer still valid?","sentAt":"2026-10-28T10:15:00Z"}'
 ```
 
@@ -134,9 +81,9 @@ The first response contains `{ duplicate: false, message }`. A provider retry th
 List conversations (use the agent ID printed by `npm run db:seed`):
 
 ```sh
-1='paste-the-generated-agent-id'
-curl --get "http://localhost:3000/locations/loc_1/conversations?limit=25&status=open&assignedTo=1" \
-  -H 'Authorization: Bearer INBOX_TOKEN'
+AGENT_ID='paste-the-generated-agent-id'
+curl --get "http://localhost:3000/locations/loc_1/conversations?limit=25&status=open&assignedTo=$AGENT_ID" \
+  -H 'Authorization: Bearer $INBOX_TOKEN'
 ```
 
 Filters are optional. Omit both to list all conversations. The response contains a flat `data` array of conversation summaries, plus root-level `nextCursor` and `hasMore` fields:
@@ -175,20 +122,20 @@ Each summary includes the latest message channel; participant IDs and full messa
 ```sh
 # Replace CONVERSATION_ID with a returned integer ID.
 curl 'http://localhost:3000/conversations/CONVERSATION_ID/messages?limit=25' \
-  -H 'Authorization: Bearer INBOX_TOKEN'
+  -H 'Authorization: Bearer $INBOX_TOKEN'
 
 curl -X POST http://localhost:3000/conversations/CONVERSATION_ID/messages \
-  -H 'Authorization: Bearer INBOX_TOKEN' \
+  -H 'Authorization: Bearer $INBOX_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{"channel":"whatsapp","body":"Yes, valid till Friday!"}'
 
 curl -X POST http://localhost:3000/conversations/CONVERSATION_ID/read \
-  -H 'Authorization: Bearer INBOX_TOKEN'
+  -H 'Authorization: Bearer $INBOX_TOKEN'
 
 curl -X PATCH http://localhost:3000/conversations/CONVERSATION_ID \
-  -H 'Authorization: Bearer INBOX_TOKEN' \
+  -H 'Authorization: Bearer $INBOX_TOKEN' \
   -H 'Content-Type: application/json' \
-  -d "{\"status\":\"closed\",\"assignedTo\":1}"
+  -d "{\"status\":\"closed\",\"assignedTo\":$AGENT_ID}"
 ```
 
 Outbound requests return HTTP 202 and the persisted `queued` message. Set `assignedTo` to `null` to unassign. A reply reverses the sender and recipient of the latest inbound message. When changing channels, both participants must have an identity for the requested channel; otherwise sending returns 400. Participant A/B order is only used to identify the conversation and does not determine message direction.
@@ -198,7 +145,7 @@ Delivery callback (use the outbound response's `providerMessageId`):
 ```sh
 curl -X POST http://localhost:3000/webhooks/status \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer WEBHOOK_TOKEN' \
+  -H 'Authorization: Bearer $WEBHOOK_TOKEN' \
   -d '{"providerMessageId":"mock_REPLACE_WITH_RETURNED_ID","status":"delivered","timestamp":"2026-10-28T10:16:00Z"}'
 ```
 
@@ -208,7 +155,7 @@ Real-time subscription:
 
 ```sh
 curl -N http://localhost:3000/locations/loc_1/events \
-  -H 'Authorization: Bearer INBOX_TOKEN'
+  -H 'Authorization: Bearer $INBOX_TOKEN'
 ```
 
 Optionally add `?agentId=<id>` to announce that agent's presence. Events: `message.new` (message and updated conversation), `message.status` (updated message), and `conversation.updated`. Reconnect with `Last-Event-ID: <last received event ID>` to replay later events. Without that header, the stream starts at the current location watermark. Use authenticated `fetch` streaming or an SSE client that supports headers; native browser `EventSource` does not allow a custom Authorization header.
@@ -217,10 +164,10 @@ Typing indicators and presence (optional bonus implemented):
 
 ```sh
 curl -X POST http://localhost:3000/locations/loc_1/typing \
-  -H 'Authorization: Bearer INBOX_TOKEN' -H 'Content-Type: application/json' \
-  -d "{\"conversationId\":CONVERSATION_ID,\"agentId\":1,\"typing\":true}"
+  -H 'Authorization: Bearer $INBOX_TOKEN' -H 'Content-Type: application/json' \
+  -d "{\"conversationId\":CONVERSATION_ID,\"agentId\":$AGENT_ID,\"typing\":true}"
 
-curl http://localhost:3000/locations/loc_1/presence -H 'Authorization: Bearer INBOX_TOKEN'
+curl http://localhost:3000/locations/loc_1/presence -H 'Authorization: Bearer $INBOX_TOKEN'
 ```
 
 Subscribers of the same location's SSE stream receive `typing` (`conversationId`, `agentId`, `typing`) and, for streams opened with `?agentId=`, `presence.online` / `presence.offline` plus an initial `presence.snapshot`. These events are ephemeral: they carry no `id:` line, are not stored and are not replayed. They are fanned out in memory, so they only reach streams on the same API instance; multi-instance fan-out would use Postgres `LISTEN/NOTIFY` or the broker from the design note.
@@ -229,315 +176,10 @@ Search (optional bonus implemented):
 
 ```sh
 curl 'http://localhost:3000/locations/loc_1/messages/search?q=offer&limit=25' \
-  -H 'Authorization: Bearer INBOX_TOKEN'
+  -H 'Authorization: Bearer $INBOX_TOKEN'
 ```
 
 Search uses PostgreSQL full-text matching with the `simple` dictionary, newest first. It supports snapshot cursors too. This is token matching, not arbitrary substring/fuzzy search.
-
-## Complete cURL reference
-
-The examples below work against the local server from the setup guide. Use a second terminal while `npm run start:dev` is running. Set the token values to exactly what you put in `.env.local`; set `AGENT_ID` to the integer printed by `npm run db:seed`.
-
-```sh
-BASE_URL='http://localhost:3000'
-LOCATION_ID='loc_1'
-INBOX_TOKEN='paste-your-INBOX_TOKEN-here'
-WEBHOOK_TOKEN='paste-your-WEBHOOK_TOKEN-here'
-ADMIN_TOKEN='paste-your-ADMIN_TOKEN-here'
-AGENT_ID='paste-agent_1-integer-from-seed-output'
-```
-
-### Health and agent administration
-
-Health does not require authentication:
-
-```sh
-curl -sS "$BASE_URL/health"
-```
-
-Create a global agent with the admin token (optional; the seed already creates two):
-
-```sh
-curl -sS -X POST "$BASE_URL/admin/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{"name":"Support Agent"}'
-```
-
-### Inbound webhooks
-
-Use a unique provider message ID for each new request. These examples use seeded identities, so all three channels resolve to the same contact pair at `loc_1`.
-
-**SMS**
-
-```sh
-curl -sS -X POST "$BASE_URL/webhooks/inbound" \
-  -H "Authorization: Bearer $WEBHOOK_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{
-    "providerMessageId": "SM_curl_001",
-    "locationId": "loc_1",
-    "channel": "sms",
-    "from": "+91 98765 43210",
-    "to": "+91 80000 00000",
-    "body": "Is the offer still valid?",
-    "sentAt": "2026-10-28T10:15:00Z"
-  }'
-```
-
-**WhatsApp**
-
-```sh
-curl -sS -X POST "$BASE_URL/webhooks/inbound" \
-  -H "Authorization: Bearer $WEBHOOK_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{
-    "providerMessageId": "WA_curl_001",
-    "locationId": "loc_1",
-    "channel": "whatsapp",
-    "from": "whatsapp:+919876543210",
-    "to": "whatsapp:+918000000000",
-    "body": "Following up on WhatsApp about the offer.",
-    "sentAt": "2026-10-28T10:16:00Z"
-  }'
-```
-
-**Email**
-
-```sh
-curl -sS -X POST "$BASE_URL/webhooks/inbound" \
-  -H "Authorization: Bearer $WEBHOOK_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{
-    "providerMessageId": "EM_curl_001",
-    "locationId": "loc_1",
-    "channel": "email",
-    "from": "Customer@Example.com",
-    "to": "inbox@example.com",
-    "body": "Please email the offer details.",
-    "sentAt": "2026-10-28T10:17:00Z"
-  }'
-```
-
-To try a retry, send the exact same request again: it returns the original message with `duplicate: true` and does not create a second message. Reusing an ID with a different payload returns HTTP 409.
-
-### Conversations and pagination
-
-List conversations at a location (filters are optional):
-
-```sh
-curl -sS --get "$BASE_URL/locations/$LOCATION_ID/conversations" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  --data-urlencode 'limit=25'
-```
-
-Filter by status and assigned agent:
-
-```sh
-curl -sS --get "$BASE_URL/locations/$LOCATION_ID/conversations" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  --data-urlencode 'status=open' \
-  --data-urlencode "assignedTo=$AGENT_ID" \
-  --data-urlencode 'limit=10'
-```
-
-Copy the response's root-level `nextCursor` for the next page, keeping the filters the same:
-
-```sh
-CONVERSATIONS_CURSOR='paste-nextCursor-from-the-previous-response'
-
-curl -sS --get "$BASE_URL/locations/$LOCATION_ID/conversations" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  --data-urlencode 'status=open' \
-  --data-urlencode "assignedTo=$AGENT_ID" \
-  --data-urlencode 'limit=10' \
-  --data-urlencode "cursor=$CONVERSATIONS_CURSOR"
-```
-
-Copy a `conversationId` from a response and set it before using conversation endpoints:
-
-```sh
-CONVERSATION_ID='paste-conversationId-here'
-```
-
-Get messages for that conversation (oldest first):
-
-```sh
-curl -sS --get "$BASE_URL/conversations/$CONVERSATION_ID/messages" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  --data-urlencode 'limit=25'
-```
-
-For another page, copy `data.nextCursor` and use the same limit:
-
-```sh
-MESSAGES_CURSOR='paste-data.nextCursor-from-the-previous-response'
-
-curl -sS --get "$BASE_URL/conversations/$CONVERSATION_ID/messages" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  --data-urlencode 'limit=25' \
-  --data-urlencode "cursor=$MESSAGES_CURSOR"
-```
-
-Pagination cursors expire after 15 minutes. If a cursor returns HTTP 410, start a new listing.
-
-### Outbound messages and delivery status
-
-The mock worker processes outbound messages asynchronously. The initial response is HTTP 202 and contains the queued message. Both participants need an identity for the selected channel.
-
-```sh
-curl -sS -X POST "$BASE_URL/conversations/$CONVERSATION_ID/messages" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{"channel":"sms","body":"Yes, the offer is valid till Friday!"}'
-
-curl -sS -X POST "$BASE_URL/conversations/$CONVERSATION_ID/messages" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{"channel":"whatsapp","body":"Here are your offer details."}'
-
-curl -sS -X POST "$BASE_URL/conversations/$CONVERSATION_ID/messages" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{"channel":"email","body":"Your offer is valid till Friday. Thank you!"}'
-```
-
-Copy `data.providerMessageId` from an outbound response, then simulate a delivery callback:
-
-```sh
-PROVIDER_MESSAGE_ID='paste-providerMessageId-here'
-
-curl -sS -X POST "$BASE_URL/webhooks/status" \
-  -H "Authorization: Bearer $WEBHOOK_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw "{
-    \"providerMessageId\": \"$PROVIDER_MESSAGE_ID\",
-    \"status\": \"delivered\",
-    \"timestamp\": \"2026-10-28T10:18:00Z\"
-  }"
-```
-
-Use `queued`, `sent`, `delivered`, `read`, or `failed` as the callback status. Include a timezone in the timestamp. Status never moves backward, and `failed` is terminal.
-
-### Assignment, status, and unread count
-
-Assign the conversation to the seeded agent:
-
-```sh
-curl -sS -X PATCH "$BASE_URL/conversations/$CONVERSATION_ID" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw "{\"assignedTo\":$AGENT_ID}"
-```
-
-Close the conversation:
-
-```sh
-curl -sS -X PATCH "$BASE_URL/conversations/$CONVERSATION_ID" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{"status":"closed"}'
-```
-
-Reopen and assign in one request:
-
-```sh
-curl -sS -X PATCH "$BASE_URL/conversations/$CONVERSATION_ID" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw "{\"status\":\"open\",\"assignedTo\":$AGENT_ID}"
-```
-
-Unassign by setting the agent to `null`:
-
-```sh
-curl -sS -X PATCH "$BASE_URL/conversations/$CONVERSATION_ID" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw '{"assignedTo":null}'
-```
-
-Mark the conversation as read:
-
-```sh
-curl -sS -X POST "$BASE_URL/conversations/$CONVERSATION_ID/read" \
-  -H "Authorization: Bearer $INBOX_TOKEN"
-```
-
-Marking a conversation read resets its unread count; it does not change message delivery receipts. A new inbound message reopens a closed conversation.
-
-### Search
-
-Search a location's messages (full-text word/token search, newest first):
-
-```sh
-curl -sS --get "$BASE_URL/locations/$LOCATION_ID/messages/search" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  --data-urlencode 'q=offer' \
-  --data-urlencode 'limit=25'
-```
-
-For the next page, copy `data.nextCursor` and keep the query unchanged:
-
-```sh
-SEARCH_CURSOR='paste-data.nextCursor-from-the-previous-response'
-
-curl -sS --get "$BASE_URL/locations/$LOCATION_ID/messages/search" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  --data-urlencode 'q=offer' \
-  --data-urlencode 'limit=25' \
-  --data-urlencode "cursor=$SEARCH_CURSOR"
-```
-
-### Server-sent events (SSE), typing, and presence
-
-This stream stays connected until Ctrl+C. Run it in a separate terminal; other API requests can publish events while it is open:
-
-```sh
-curl -sS -N "$BASE_URL/locations/$LOCATION_ID/events" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Accept: text/event-stream'
-```
-
-To resume after an event, set `LAST_EVENT_ID` to the last received numeric `id:` value. Use `0` to replay retained events from the beginning:
-
-```sh
-LAST_EVENT_ID='0'
-
-curl -sS -N "$BASE_URL/locations/$LOCATION_ID/events" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Accept: text/event-stream' \
-  -H "Last-Event-ID: $LAST_EVENT_ID"
-```
-
-Add `?agentId=$AGENT_ID` to the events URL to announce agent presence on that stream. Native browser `EventSource` cannot send the Authorization header; use `curl` or an authenticated streaming client.
-
-Send a typing indicator:
-
-```sh
-curl -sS -X POST "$BASE_URL/locations/$LOCATION_ID/typing" \
-  -H "Authorization: Bearer $INBOX_TOKEN" \
-  -H 'Content-Type: application/json' \
-  --data-raw "{\"conversationId\":$CONVERSATION_ID,\"agentId\":$AGENT_ID,\"typing\":true}"
-```
-
-Get the currently connected agents:
-
-```sh
-curl -sS "$BASE_URL/locations/$LOCATION_ID/presence" \
-  -H "Authorization: Bearer $INBOX_TOKEN"
-```
-
-Typing and presence notifications are ephemeral: they are not stored or replayed. Presence snapshots/online/offline events are sent to streams opened with `agentId`.
-
-### Request a different location
-
-The seeded inbox token can access both locations; agents are global, but conversations are location-scoped:
-
-```sh
-curl -sS "$BASE_URL/locations/loc_2/conversations" \
-  -H "Authorization: Bearer $INBOX_TOKEN"
-```
 
 ## Data model and indexes
 
