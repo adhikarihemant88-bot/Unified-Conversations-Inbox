@@ -7,7 +7,4 @@ export class Contact {
 
   @Column({ name: 'location_id', type: 'integer' })
   locationId: number;
-
-  @Column({ type: 'text', nullable: true })
-  name: string | null;
 }

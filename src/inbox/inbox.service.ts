@@ -14,6 +14,8 @@ import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
 import { SendJob } from '../entities/send-job.entity';
 import { DatabaseService } from '../utils/database.service';
 import { Channels } from './channels';
+import { EventsService } from './events.service';
+import type { TypingDto } from './dto/typing.dto';
 import type { SendMessageDto } from './dto/send-message.dto';
 import type { UpdateConversationDto } from './dto/update-conversation.dto';
 import type {
@@ -35,6 +37,7 @@ export class InboxService {
   constructor(
     private readonly db: DatabaseService,
     private readonly channels: Channels,
+    private readonly events: EventsService,
   ) {}
 
   async resolveLocationId(name: string): Promise<number> {
@@ -43,6 +46,35 @@ export class InboxService {
     );
     if (!location) throw new NotFoundException('Location not found');
     return location.id;
+  }
+
+  async assertAgentAtLocation(locationId: number, agentId: number) {
+    if (
+      !(await this.db
+        .getRepository(Agent)
+        .existsBy({ id: agentId, locationId }))
+    )
+      throw new BadRequestException('Agent does not exist at this location');
+  }
+
+  async typing(locationName: string, data: TypingDto) {
+    const location = await this.resolveLocationId(locationName);
+    const conversation = await this.db
+      .getRepository(ConversationEntity)
+      .findOneBy({ id: data.conversationId, locationId: location });
+    if (!conversation) throw new NotFoundException('Conversation not found');
+    await this.assertAgentAtLocation(location, data.agentId);
+    this.events.publish(location, 'typing', {
+      conversationId: data.conversationId,
+      agentId: data.agentId,
+      typing: data.typing,
+    });
+    return { accepted: true };
+  }
+
+  async presence(locationName: string) {
+    const location = await this.resolveLocationId(locationName);
+    return { agentIds: this.events.onlineAgents(location) };
   }
 
   async send(conversationId: number, data: SendMessageDto) {
@@ -174,11 +206,13 @@ export class InboxService {
       if (!conversation) throw new NotFoundException('Conversation not found');
       if (
         typeof data.assignedTo === 'number' &&
-        !(await manager.getRepository(Agent).existsBy({ id: data.assignedTo }))
+        !(await manager
+          .getRepository(Agent)
+          .existsBy({ id: data.assignedTo, locationId: location }))
       )
-        throw new BadRequestException('Agent does not exist');
+        throw new BadRequestException('Agent does not exist at this location');
       if (typeof data.assignedTo === 'number') {
-        await markAgentAssigned(manager, data.assignedTo);
+        await markAgentAssigned(manager, location, data.assignedTo);
       }
       if (data.status !== undefined) conversation.status = data.status;
       if (data.assignedTo !== undefined)

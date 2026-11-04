@@ -3,13 +3,11 @@ import { Contact } from '../entities/contact.entity';
 import { ContactIdentity } from '../entities/contact-identity.entity';
 import { Conversation } from '../entities/conversation.entity';
 import { Agent } from '../entities/agent.entity';
-import { Location } from '../entities/location.entity';
 import { Message } from '../entities/message.entity';
 import { ProviderState } from '../entities/provider-state.entity';
 import { advance, type DeliveryStatus } from '../inbox/domain';
 import {
   event,
-  lockAgentAssignments,
   markAgentAssigned,
   messageView,
   updateLastMessage,
@@ -48,6 +46,10 @@ export async function findOrCreateConversation(
   firstContactId: number,
   secondContactId: number,
 ): Promise<Conversation> {
+  // Precondition: the caller already holds the location row lock
+  // (lockLocation in WebhookService.inbound). That lock serializes new-conversation
+  // creation and agent assignment per location, so the single lookup below cannot
+  // race with another creator.
   const conversations = manager.getRepository(Conversation);
   const [participantAId, participantBId] = [
     firstContactId,
@@ -60,26 +62,16 @@ export async function findOrCreateConversation(
   });
   if (existing) return existing;
 
-  await manager.getRepository(Location).findOneOrFail({
-    where: { id: locationId },
-    lock: { mode: 'pessimistic_write' },
-  });
-  const afterLock = await conversations.findOne({
-    where,
-    lock: { mode: 'pessimistic_write' },
-  });
-  if (afterLock) return afterLock;
-
   const agents = manager.getRepository(Agent);
-  await lockAgentAssignments(manager);
   const agent = await agents
     .createQueryBuilder('agent')
+    .where('agent.locationId = :locationId', { locationId })
     .orderBy('agent.lastAssignedAt', 'ASC', 'NULLS FIRST')
     .addOrderBy('agent.id', 'ASC')
     .setLock('pessimistic_write')
     .getOne();
   if (agent) {
-    await markAgentAssigned(manager, agent.id);
+    await markAgentAssigned(manager, locationId, agent.id);
   }
 
   await conversations

@@ -37,10 +37,11 @@ export class WebhookService {
     return this.db.ormTransaction(async (manager) => {
       const provider = await providerLock(manager, providerMessageId, sentAt);
       const messages = manager.getRepository(Message);
-      if (await messages.existsBy({ providerMessageId })) {
+      const locations = manager.getRepository(Location);
+      const existing = await messages.findOneBy({ providerMessageId });
+      if (existing) {
         throw new ConflictException('Duplicate providerMessageId');
       }
-      const locations = manager.getRepository(Location);
       let location = await locations.findOneBy({ name: locationName });
       if (!location) {
         //if location is not found adding it to the database

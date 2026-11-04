@@ -5,6 +5,9 @@ export class Agent {
   @PrimaryGeneratedColumn('identity', { type: 'integer' })
   id: number;
 
+  @Column({ name: 'location_id', type: 'integer' })
+  locationId: number;
+
   @Column('text')
   name: string;
 

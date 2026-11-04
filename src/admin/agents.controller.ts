@@ -2,10 +2,12 @@ import {
   Body,
   ConflictException,
   Controller,
+  NotFoundException,
   Post,
   UseGuards,
 } from '@nestjs/common';
 import { Agent } from '../entities/agent.entity';
+import { Location } from '../entities/location.entity';
 import { DatabaseService } from '../utils/database.service';
 import { BearerAuthGuard, UseBearerToken } from '../common/bearer-auth';
 import { CreateAgentDto } from './dto/create-agent.dto';
@@ -21,16 +23,21 @@ export class AgentsController {
     return this.db.ormTransaction(async (manager) => {
       const agents = manager.getRepository(Agent);
       const name = body.name.trim();
+      const location = await manager
+        .getRepository(Location)
+        .findOneBy({ name: body.locationId.trim() });
+      if (!location) throw new NotFoundException('Location not found');
       const existing = await agents
         .createQueryBuilder('agent')
-        .where('LOWER(BTRIM(agent.name)) = LOWER(BTRIM(:name))', { name })
+        .where('agent.locationId = :locationId', { locationId: location.id })
+        .andWhere('LOWER(BTRIM(agent.name)) = LOWER(BTRIM(:name))', { name })
         .getOne();
       if (existing) throw new ConflictException('Agent already exists');
 
       const result = await agents
         .createQueryBuilder()
         .insert()
-        .values({ name, lastAssignedAt: new Date() })
+        .values({ name, locationId: location.id, lastAssignedAt: new Date() })
         .orIgnore()
         .execute();
       const id = result.identifiers[0]?.id;
@@ -38,7 +45,7 @@ export class AgentsController {
         throw new ConflictException('Agent already exists');
 
       const agent = await agents.findOneByOrFail({ id });
-      return { id: agent.id, name: agent.name };
+      return { id: agent.id, name: agent.name, locationId: location.name };
     });
   }
 }

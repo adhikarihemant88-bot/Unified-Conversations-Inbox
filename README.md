@@ -4,7 +4,7 @@ NestJS + TypeScript + PostgreSQL backend for one conversation per participant pa
 
 ## Run locally
 
-Requirements: Node.js 22.15+ and PostgreSQL 17+ (or Docker Compose). PostgreSQL is the only service required; Redis is not used.
+Requirements: Node.js 22.15+ (Node 24.9+ to run the Jest suites, which load ESM-only NestJS packages) and PostgreSQL 17+ (or Docker Compose). PostgreSQL is the only service required; Redis is not used.
 
 ```sh
 npm ci
@@ -15,11 +15,11 @@ npm run db:seed
 npm run start:dev
 ```
 
-Set distinct random `INBOX_TOKEN`, `WEBHOOK_TOKEN`, and `ADMIN_TOKEN` values in `.env.local`. Every protected endpoint uses `Authorization: Bearer <token>`; each API group accepts only its matching environment token. The inbox token authenticates inbox requests, while location is taken from each endpoint's path/body or resolved from its conversation ID. If using an existing PostgreSQL server, set `DATABASE_URL` there and omit the Docker step. Migrations change the database you explicitly configure; use a development database. Existing environment variables take precedence over `.env.local`, which takes precedence over `.env`. Your existing environment files are not modified by this project.
+Set distinct random `INBOX_TOKEN`, `WEBHOOK_TOKEN`, and `ADMIN_TOKEN` values in `.env.local`, and optionally `INBOX_LOCATION_TOKENS` for per-location agent credentials. Every protected endpoint uses `Authorization: Bearer <token>`; each API group accepts only its matching environment token. The inbox token authenticates inbox requests, while location is taken from each endpoint's path/body or resolved from its conversation ID. If using an existing PostgreSQL server, set `DATABASE_URL` there and omit the Docker step. Migrations change the database you explicitly configure; use a development database. Existing environment variables take precedence over `.env.local`, which takes precedence over `.env`. Your existing environment files are not modified by this project.
 
-`npm run db:migrate` applies the single `db/001_init.sql` schema transactionally and is safe to repeat. It creates the schema for a fresh database. Existing databases with an earlier schema require a separate data migration before using this version. `npm run db:seed` creates two demo locations and global agents, plus two participants at `loc_1`: `+919876543210` / `customer@example.com` and `+918000000000` / `inbox@example.com`. Each participant's phone and email identities are linked to their contact.
+`npm run db:migrate` applies the single `db/001_init.sql` schema transactionally and is safe to repeat. It creates the schema for a fresh database. Existing databases with an earlier schema require a separate data migration before using this version. `npm run db:seed` creates two demo locations with one agent each, plus two participants at `loc_1`: `+919876543210` / `customer@example.com` and `+918000000000` / `inbox@example.com`. Each participant's phone and email identities are linked to their contact.
 
-Location, agent, contact, conversation, message, event, and pagination snapshot IDs are generated integers. Agents are global assignment targets and are not tied to a location. The webhook's `locationId` value and the location path segment (for example `loc_1`) refer to the unique location name.
+Location, agent, contact, conversation, message, event, and pagination snapshot IDs are generated integers. Each agent belongs to exactly one location and can only be assigned conversations at that location. The webhook's `locationId` value and the location path segment (for example `loc_1`) refer to the unique location name.
 
 The seed command prints generated integer agent IDs; use those values for `assignedTo` and its filters. These are development fixtures. Authentication is handled by separate module bearer tokens in `.env.local`; the webhook token grants trusted provider access to all locations. In a real integration, verify provider signatures and derive location from the registered provider account.
 
@@ -44,7 +44,7 @@ The worker starts with the application. Set `WORKER_ENABLED=false` for an API-on
 
 For every endpoint, all three channels, pagination, assignment variants and SSE replay, see [the complete cURL examples](./docs/curl-examples.md).
 
-Create a global agent with `POST /admin/agents`, using the configured `ADMIN_TOKEN` as a bearer token. Send `{ "name": "Agent name" }`; the response includes the generated integer ID and name. Agent names are unique case-insensitively after trimming; an existing name returns HTTP 409 without creating another agent.
+Create an agent with `POST /admin/agents`, using the configured `ADMIN_TOKEN` as a bearer token. Send `{ "name": "Agent name", "locationId": "loc_1" }` (the location name; an unknown location returns HTTP 404); the response includes the generated integer ID, name and location. Agent names are unique case-insensitively after trimming within a location, so the same name may exist at different locations; a duplicate at the same location returns HTTP 409 without creating another agent.
 
 All JSON responses use `{ "status": 200, "message": "Success", "data": ... }`. Validation errors use HTTP 400, unauthorized requests 401, unknown locations or conversations 404, conflicting provider IDs 409, and expired/incompatible pagination cursors 410. Location-scoped endpoints take the location name from the route (or webhook payload); conversation-ID endpoints resolve location from the stored conversation. Unexpected errors return a generic HTTP 500 response; details stay in server logs. SSE uses standard event-stream framing.
 
@@ -55,18 +55,18 @@ Inbound webhook:
 ```sh
 curl -X POST http://localhost:3000/webhooks/inbound \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer $WEBHOOK_TOKEN' \
+  -H "Authorization: Bearer $WEBHOOK_TOKEN" \
   -d '{"providerMessageId":"SM_abc123","locationId":"loc_1","channel":"sms","from":"+91 98765 43210","to":"+91 80000 00000","body":"Is the offer still valid?","sentAt":"2026-10-28T10:15:00Z"}'
 ```
 
-The first response contains `{ duplicate: false, message }`. Reusing a `providerMessageId` returns HTTP 409 (`Duplicate providerMessageId`), with no second stored message, counter increment, reopening or event.
+The first response contains `{ duplicate: false, message }`. A provider retry that replays the same payload returns HTTP 200 with `{ duplicate: true, message }` (the originally stored message), so providers stop retrying; nothing is stored, counted, reopened or published a second time. Reusing a `providerMessageId` with a different payload or location returns HTTP 409 (`Duplicate providerMessageId`).
 
 List conversations (use the agent ID printed by `npm run db:seed`):
 
 ```sh
 AGENT_ID='paste-the-generated-agent-id'
 curl --get "http://localhost:3000/locations/loc_1/conversations?limit=25&status=open&assignedTo=$AGENT_ID" \
-  -H 'Authorization: Bearer $INBOX_TOKEN'
+  -H "Authorization: Bearer $INBOX_TOKEN"
 ```
 
 Filters are optional. Omit both to list all conversations. The response contains a flat `data` array of conversation summaries, plus root-level `nextCursor` and `hasMore` fields:
@@ -105,18 +105,18 @@ Each summary includes the latest message channel; participant IDs and full messa
 ```sh
 # Replace CONVERSATION_ID with a returned integer ID.
 curl 'http://localhost:3000/conversations/CONVERSATION_ID/messages?limit=25' \
-  -H 'Authorization: Bearer $INBOX_TOKEN'
+  -H "Authorization: Bearer $INBOX_TOKEN"
 
 curl -X POST http://localhost:3000/conversations/CONVERSATION_ID/messages \
-  -H 'Authorization: Bearer $INBOX_TOKEN' \
+  -H "Authorization: Bearer $INBOX_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"channel":"whatsapp","body":"Yes, valid till Friday!"}'
 
 curl -X POST http://localhost:3000/conversations/CONVERSATION_ID/read \
-  -H 'Authorization: Bearer $INBOX_TOKEN'
+  -H "Authorization: Bearer $INBOX_TOKEN"
 
 curl -X PATCH http://localhost:3000/conversations/CONVERSATION_ID \
-  -H 'Authorization: Bearer $INBOX_TOKEN' \
+  -H "Authorization: Bearer $INBOX_TOKEN" \
   -H 'Content-Type: application/json' \
   -d "{\"status\":\"closed\",\"assignedTo\":$AGENT_ID}"
 ```
@@ -128,7 +128,7 @@ Delivery callback (use the outbound response's `providerMessageId`):
 ```sh
 curl -X POST http://localhost:3000/webhooks/status \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer $WEBHOOK_TOKEN' \
+  -H "Authorization: Bearer $WEBHOOK_TOKEN" \
   -d '{"providerMessageId":"mock_REPLACE_WITH_RETURNED_ID","status":"delivered","timestamp":"2026-10-28T10:16:00Z"}'
 ```
 
@@ -138,16 +138,28 @@ Real-time subscription:
 
 ```sh
 curl -N http://localhost:3000/locations/loc_1/events \
-  -H 'Authorization: Bearer $INBOX_TOKEN'
+  -H "Authorization: Bearer $INBOX_TOKEN"
 ```
 
-Events: `message.new` (message and updated conversation), `message.status` (updated message), and `conversation.updated`. Reconnect with `Last-Event-ID: <last received event ID>` to replay later events. Without that header, the stream starts at the current location watermark. Use authenticated `fetch` streaming or an SSE client that supports headers; native browser `EventSource` does not allow a custom Authorization header.
+Optionally add `?agentId=<id>` to announce that agent's presence. Events: `message.new` (message and updated conversation), `message.status` (updated message), and `conversation.updated`. Reconnect with `Last-Event-ID: <last received event ID>` to replay later events. Without that header, the stream starts at the current location watermark. Use authenticated `fetch` streaming or an SSE client that supports headers; native browser `EventSource` does not allow a custom Authorization header.
+
+Typing indicators and presence (optional bonus implemented):
+
+```sh
+curl -X POST http://localhost:3000/locations/loc_1/typing \
+  -H "Authorization: Bearer $INBOX_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"conversationId\":CONVERSATION_ID,\"agentId\":$AGENT_ID,\"typing\":true}"
+
+curl http://localhost:3000/locations/loc_1/presence -H "Authorization: Bearer $INBOX_TOKEN"
+```
+
+Subscribers of the same location's SSE stream receive `typing` (`conversationId`, `agentId`, `typing`) and, for streams opened with `?agentId=`, `presence.online` / `presence.offline` plus an initial `presence.snapshot`. These events are ephemeral: they carry no `id:` line, are not stored and are not replayed. They are fanned out in memory, so they only reach streams on the same API instance; multi-instance fan-out would use Postgres `LISTEN/NOTIFY` or the broker from the design note.
 
 Search (optional bonus implemented):
 
 ```sh
 curl 'http://localhost:3000/locations/loc_1/messages/search?q=offer&limit=25' \
-  -H 'Authorization: Bearer $INBOX_TOKEN'
+  -H "Authorization: Bearer $INBOX_TOKEN"
 ```
 
 Search uses PostgreSQL full-text matching with the `simple` dictionary, newest first. It supports snapshot cursors too. This is token matching, not arbitrary substring/fuzzy search.
@@ -159,7 +171,7 @@ The schema is defined by the initialization migration in [db/](./db/).
 | Table                  | Purpose / guarantees                                                                                                                                                                                                                |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `locations`            | Generated integer primary key and unique name; incoming `locationId` values are stored as names.                                                                                                                                    |
-| `agents`               | Generated integer primary key, name, and last-assigned timestamp; agents are global and can be assigned to conversations at any location.                                                                                           |
+| `agents`               | Generated integer primary key, name, and last-assigned timestamp; each agent belongs to one location (`location_id`); a composite foreign key `(location_id, assigned_to)` lets a conversation be assigned only to an agent at its own location.                                                                                           |
 | `contacts`             | Generated integer ID for each canonical participant within one location.                                                                                                                                                            |
 | `contact_identities`   | Unique `(location_id, kind, value)`; phone/email identities reference the same integer contact ID explicitly.                                                                                                                       |
 | `conversations`        | Generated integer primary key; unique `(location_id, participant_a_id, participant_b_id)` with numerically sorted contact IDs and location-scoped foreign keys for both participants; nonnegative unread count; open/closed status. |
@@ -183,7 +195,7 @@ An inbound webhook finds the location by `name` using the supplied `locationId` 
 
 Both `from` and `to` resolve to contacts using `findOneBy` with `(locationId, kind, normalizedValue)`. Addresses are resolved sequentially in sorted order so simultaneous A-to-B and B-to-A messages cannot wait on newly created identities in opposite orders. If missing, insert a contact and its identity. The unique identity key handles concurrent first messages: TypeORM's insert builder ignores a conflicting identity, then a fresh lookup returns the winning contact. The losing transaction deletes only its own unused new contact. Existing contacts are returned immediately. There are no identity advisory locks or CTEs.
 
-Conversation lookup numerically sorts the two generated contact IDs, then uses `findOne` by `(locationId, participantAId, participantBId)` and inserts a conversation if missing. A newly created conversation is assigned to the global agent with the oldest `last_assigned_at`; agents with no prior assignments are first, with agent ID breaking ties. A location-row lock serializes new-conversation assignment and manual assignment updates, preventing concurrent inbound requests from selecting the same stale oldest agent. Assignment timestamps are ordered across all agents. New messages on an existing conversation do not reassign it. If there are no agents, a new conversation remains unassigned. Sender/recipient order and channel are not part of the conversation key. A-to-B and B-to-A messages share one conversation at `loc_1`; the same pair has a different conversation at `loc_2`. A-to-C is also a separate conversation at `loc_1`. Internal conversation records and event payloads retain the participant pair; the conversation-list summary response omits those IDs and exposes `contactId` with the mapped contact identities instead. The existing unique constraint handles concurrent first messages; a conflicting insert is ignored and followed by a fresh lookup of the conversation created by the other request. A TypeORM pessimistic write lock keeps updates to that conversation serialized with incoming messages and mark-as-read.
+Conversation lookup numerically sorts the two generated contact IDs, then uses `findOne` by `(locationId, participantAId, participantBId)` and inserts a conversation if missing. A newly created conversation is assigned to the agent at the same location with the oldest `last_assigned_at`; agents with no prior assignments are first, with agent ID breaking ties. The location-row lock serializes new-conversation assignment and manual assignment updates within that location, preventing concurrent inbound requests from selecting the same stale oldest agent; because agents are location-scoped, no global assignment lock is needed. Assignment timestamps are ordered across the agents of one location. Manual assignment, typing and `?agentId=` presence reject agents from another location with HTTP 400. New messages on an existing conversation do not reassign it. If there are no agents, a new conversation remains unassigned. Sender/recipient order and channel are not part of the conversation key. A-to-B and B-to-A messages share one conversation at `loc_1`; the same pair has a different conversation at `loc_2`. A-to-C is also a separate conversation at `loc_1`. Internal conversation records and event payloads retain the participant pair; the conversation-list summary response omits those IDs and exposes `contactId` with the mapped contact identities instead. The existing unique constraint handles concurrent first messages; a conflicting insert is ignored and followed by a fresh lookup of the conversation created by the other request. A TypeORM pessimistic write lock keeps updates to that conversation serialized with incoming messages and mark-as-read.
 
 The existing unread/preview behavior is a separate step after find-or-create. It updates the locked entity and saves it through its repository. The webhook flow, including message and event writes, contains no raw SQL. TypeORM's insert builder is used only where concurrent requests need an insert that ignores a unique-key conflict.
 
@@ -213,7 +225,7 @@ Trade-off: snapshot creation stores the entire result and scales with inbox/hist
 
 ### Location-isolated real-time updates
 
-Each API module uses its own bearer token (`INBOX_TOKEN`, `WEBHOOK_TOKEN`, or `ADMIN_TOKEN`). The shared inbox token grants access across locations. Location-scoped routes use the location name from the path; conversation-ID routes resolve the location from the stored conversation. Events remain filtered by the requested location and are stored in the same transaction as their state change, so no uncommitted or rolled-back state is published.
+Each API module uses its own bearer token (`INBOX_TOKEN`, `WEBHOOK_TOKEN`, or `ADMIN_TOKEN`). The shared inbox token grants access across locations (operator use). Agents should instead use a location-scoped token from `INBOX_LOCATION_TOKENS` (`loc_1:tokenA,loc_2:tokenB`): `LocationScopeGuard` rejects with HTTP 403 any request whose path location, or whose conversation's stored location, differs from the token's, including the SSE stream. Location-scoped routes use the location name from the path; conversation-ID routes resolve the location from the stored conversation. Events remain filtered by the requested location and are stored in the same transaction as their state change, so no uncommitted or rolled-back state is published.
 
 SSE polls the shared event log every 500ms and replays by event ID. Event writers use a TypeORM `for_no_key_update` lock on the location row before allocating an event ID, serializing allocation per location until commit. This lock permits foreign-key checks while ensuring an earlier uncommitted event ID cannot later appear behind a location's delivered watermark. Heartbeats run about every 15 seconds. Slow consumers disconnect and can resume with `Last-Event-ID`. Shutdown closes streams. Multiple API instances can use this shared database log without sticky sessions or an in-memory broker.
 
@@ -241,7 +253,7 @@ Coverage includes concurrent duplicates, 50 simultaneous first messages in both 
 - Database locks favor correctness for this workload. Advisory hash collisions only reduce concurrency; they do not weaken uniqueness constraints.
 - Events and orphan provider states currently have no automatic retention policy. Add retention, replay-expiry responses, monitoring and storage quotas before sustained production traffic.
 - Outbound request retries can create multiple queued messages; client request idempotency keys would prevent that. Required webhook idempotency is implemented.
-- Providers are mocked. Attachment support, contact merges, message edits/deletes and agent presence/typing are omitted. Presence/typing is an optional bonus.
+- Providers are mocked. Attachment support, contact merges, message edits/deletes and are omitted.
 - Add rate limits, pagination resource quotas, structured redacted logs, metrics, database backups, connection budgets and production deployment configuration.
 
 ### Design note: 10,000 inbound messages/second

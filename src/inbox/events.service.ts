@@ -13,8 +13,39 @@ import { DatabaseService } from '../utils/database.service';
 export class EventsService implements OnModuleDestroy {
   private readonly logger = new Logger(EventsService.name);
   private readonly connections = new Set<Response>();
+  // Ephemeral typing/presence is fanned out in memory: it is not durable, has
+  // no replay and is only visible to streams on this instance.
+  private readonly streams = new Map<
+    number,
+    Set<{ res: Response; agentId?: number }>
+  >();
   constructor(private readonly db: DatabaseService) {}
-  async open(location: number, lastId: unknown, res: Response) {
+
+  onlineAgents(location: number): number[] {
+    const agents = new Set<number>();
+    for (const { agentId } of this.streams.get(location) ?? [])
+      if (agentId !== undefined) agents.add(agentId);
+    return [...agents].sort((a, b) => a - b);
+  }
+
+  publish(location: number, type: string, payload: unknown) {
+    for (const stream of this.streams.get(location) ?? []) {
+      // No `id:` line, so ephemeral events never move Last-Event-ID.
+      if (
+        !stream.res.write(
+          `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`,
+        )
+      )
+        stream.res.end();
+    }
+  }
+
+  async open(
+    location: number,
+    lastId: unknown,
+    res: Response,
+    agentId?: number,
+  ) {
     if (
       lastId !== undefined &&
       (typeof lastId !== 'string' ||
@@ -36,10 +67,23 @@ export class EventsService implements OnModuleDestroy {
     let closed = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     this.connections.add(res);
+    const stream = { res, agentId };
+    const wasOnline =
+      agentId !== undefined && this.onlineAgents(location).includes(agentId);
+    let streams = this.streams.get(location);
+    if (!streams) this.streams.set(location, (streams = new Set()));
+    streams.add(stream);
     res.on('close', () => {
       closed = true;
       clearTimeout(timer);
       this.connections.delete(res);
+      streams.delete(stream);
+      if (streams.size === 0) this.streams.delete(location);
+      if (
+        agentId !== undefined &&
+        !this.onlineAgents(location).includes(agentId)
+      )
+        this.publish(location, 'presence.offline', { agentId });
     });
     res.status(200).set({
       'Content-Type': 'text/event-stream',
@@ -49,6 +93,12 @@ export class EventsService implements OnModuleDestroy {
     });
     res.flushHeaders();
     res.write(': connected\n\n');
+    if (agentId !== undefined) {
+      res.write(
+        `event: presence.snapshot\ndata: ${JSON.stringify({ agentIds: this.onlineAgents(location) })}\n\n`,
+      );
+      if (!wasOnline) this.publish(location, 'presence.online', { agentId });
+    }
     let heartbeat = Date.now();
     const poll = async () => {
       if (closed) return;
@@ -93,5 +143,6 @@ export class EventsService implements OnModuleDestroy {
   onModuleDestroy() {
     for (const response of this.connections) response.end();
     this.connections.clear();
+    this.streams.clear();
   }
 }

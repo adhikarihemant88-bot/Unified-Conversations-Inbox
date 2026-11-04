@@ -6,7 +6,6 @@ import {
   type ObjectLiteral,
   type Repository,
 } from 'typeorm';
-import { AgentAssignmentLock } from '../entities/agent-assignment-lock.entity';
 import { Agent } from '../entities/agent.entity';
 import { Contact } from '../entities/contact.entity';
 import { ContactIdentity } from '../entities/contact-identity.entity';
@@ -32,7 +31,6 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       url: databaseUrl(process.env.DATABASE_URL),
       entities: [
         Agent,
-        AgentAssignmentLock,
         Contact,
         ContactIdentity,
         Conversation,

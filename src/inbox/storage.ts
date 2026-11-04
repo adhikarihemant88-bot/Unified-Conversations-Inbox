@@ -1,6 +1,5 @@
 import type { EntityManager } from 'typeorm';
 import { InboxEvent } from '../entities/inbox-event.entity';
-import { AgentAssignmentLock } from '../entities/agent-assignment-lock.entity';
 import { Agent } from '../entities/agent.entity';
 import { Location } from '../entities/location.entity';
 import type { Conversation } from '../entities/conversation.entity';
@@ -29,30 +28,26 @@ export async function lockLocation(
   });
 }
 
-export async function lockAgentAssignments(
-  manager: EntityManager,
-): Promise<void> {
-  await manager.getRepository(AgentAssignmentLock).findOneOrFail({
-    where: { id: 1 },
-    lock: { mode: 'pessimistic_write' },
-  });
-}
-
+// Callers hold the location row lock (lockLocation), which serializes
+// assignment decisions within a location; agents belong to exactly one location.
 export async function markAgentAssigned(
   manager: EntityManager,
+  locationId: number,
   agentId: number,
 ): Promise<void> {
-  await lockAgentAssignments(manager);
   const agents = manager.getRepository(Agent);
   const latest = await agents.findOne({
-    where: {},
+    where: { locationId },
     order: { lastAssignedAt: 'DESC' },
     select: { lastAssignedAt: true },
   });
   const assignedAt = new Date(
     Math.max(Date.now(), (latest?.lastAssignedAt?.getTime() ?? 0) + 1),
   );
-  await agents.update({ id: agentId }, { lastAssignedAt: assignedAt });
+  await agents.update(
+    { id: agentId, locationId },
+    { lastAssignedAt: assignedAt },
+  );
 }
 
 export function conversationView(conversation: Conversation) {

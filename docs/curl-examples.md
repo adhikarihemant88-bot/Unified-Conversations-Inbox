@@ -1,6 +1,6 @@
 # cURL examples for every API
 
-Start the service after running `npm run db:migrate` and `npm run db:seed`. These examples use the seeded `loc_1` location. The seed command prints generated global agent IDs; set `AGENT_ID` to the agent used for assignment examples. No real SMS, WhatsApp or email provider is required.
+Start the service after running `npm run db:migrate` and `npm run db:seed`. These examples use the seeded `loc_1` location. The seed command prints generated agent IDs (`agent_1` belongs to `loc_1`, `agent_2` to `loc_2`); set `AGENT_ID` to the agent used for assignment examples. No real SMS, WhatsApp or email provider is required.
 
 Run this setup in your terminal first:
 
@@ -23,10 +23,10 @@ Set distinct random `INBOX_TOKEN`, `WEBHOOK_TOKEN`, and `ADMIN_TOKEN` values to 
 curl -sS -X POST "$BASE_URL/admin/agents" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  --data-raw '{"name":"Support Agent"}'
+  --data-raw '{"name":"Support Agent","locationId":"loc_1"}'
 ```
 
-The response contains the generated integer agent `id` and `name`. Use the integer ID in `assignedTo`; inbox APIs authenticate with the shared `INBOX_TOKEN`. Agent names are unique case-insensitively after trimming; a duplicate returns HTTP 409 and does not create another agent.
+The response contains the generated integer agent `id`, `name` and `locationId` (location name); an unknown location returns HTTP 404. Use the integer ID in `assignedTo`; inbox APIs authenticate with the shared `INBOX_TOKEN`. Agent names are unique case-insensitively after trimming within a location; a duplicate in the same location returns HTTP 409 and does not create another agent.
 
 ## 2. Check health
 
@@ -38,7 +38,7 @@ curl -sS "$BASE_URL/health"
 
 ## 3. Receive an inbound message
 
-`POST /webhooks/inbound` — HTTP 200 for a new message. Each example uses a different provider ID; reuse returns HTTP 409 without adding another message or unread increment.
+`POST /webhooks/inbound` — HTTP 200 for a new message. Each example uses a different provider ID; replaying the same payload returns HTTP 200 with `duplicate: true` and adds no message or unread increment; reusing the ID with a different payload returns HTTP 409.
 
 ### SMS
 
@@ -106,7 +106,7 @@ With the demo seed in place, all three messages belong to the same participant p
 `GET /locations/:locationId/conversations` — HTTP 200. Sorted by latest message, newest first. Default limit is 25; allowed range is 1–100.
 
 ```sh
-curl --location --request GET "$BASE_URL/locations/$LOCATION_ID/conversations" \
+curl -sS --get "$BASE_URL/locations/$LOCATION_ID/conversations" \
   -H "Authorization: Bearer $INBOX_TOKEN" \
   --data-urlencode 'limit=25'
 ```
@@ -128,7 +128,7 @@ For the next page of the **filtered** query, copy the root-level `nextCursor` wh
 ```sh
 CONVERSATIONS_CURSOR='paste-nextCursor-from-the-filtered-query'
 
-curl --location --request GET "$BASE_URL/locations/$LOCATION_ID/conversations" \
+curl -sS --get "$BASE_URL/locations/$LOCATION_ID/conversations" \
   -H "Authorization: Bearer $INBOX_TOKEN" \
   --data-urlencode 'status=open' \
   --data-urlencode "assignedTo=$AGENT_ID" \
@@ -224,7 +224,7 @@ curl -sS -X POST "$BASE_URL/conversations/$CONVERSATION_ID/read" \
 
 ## 9. Update a conversation
 
-`PATCH /conversations/:id` — HTTP 200. Supply status, assignment, or both. Empty updates are rejected. Agents are global and may be assigned to any location.
+`PATCH /conversations/:id` — HTTP 200. Supply status, assignment, or both. Empty updates are rejected. An agent can only be assigned to conversations at its own location (otherwise HTTP 400).
 
 Assign to an agent:
 
@@ -301,6 +301,8 @@ curl -sS -N "$BASE_URL/locations/$LOCATION_ID/events" \
 
 Send messages or callbacks from another terminal to receive `message.new`, `message.status`, or `conversation.updated` events. Without a replay header, only events after subscription initialization are sent.
 
+To also announce an agent's presence, add `?agentId=$AGENT_ID` to the URL (see section 12).
+
 Reconnect after the last received numeric event ID:
 
 ```sh
@@ -316,9 +318,37 @@ Use `0` to replay all retained events for this location, or the last received `i
 
 ## Second location
 
-The shared inbox token can access `loc_2`, and global agents can be assigned to conversations at either location:
+The shared inbox token can access `loc_2`, but agents are location-scoped, so only an agent created for `loc_2` can be assigned there:
 
 ```sh
 curl -sS "$BASE_URL/locations/loc_2/conversations" \
-  -H 'Authorization: Bearer $INBOX_TOKEN'
+  -H "Authorization: Bearer $INBOX_TOKEN"
+```
+
+## 12. Typing indicators and presence (optional bonus)
+
+Typing and presence are ephemeral events pushed over the same location SSE stream. They are not stored, carry no `id:` line and are not replayed.
+
+Open a stream as an agent, in a separate terminal. It first sends `presence.snapshot` with the agents online, and other streams at the same location receive `presence.online` / `presence.offline`:
+
+```sh
+curl -sS -N "$BASE_URL/locations/$LOCATION_ID/events?agentId=$AGENT_ID" \
+  -H "Authorization: Bearer $INBOX_TOKEN" \
+  -H 'Accept: text/event-stream'
+```
+
+`POST /locations/:locationId/typing` — HTTP 202. Subscribers of that location receive a `typing` event. The conversation must belong to the location (otherwise HTTP 404) and the agent must belong to that location (otherwise HTTP 400).
+
+```sh
+curl -sS -X POST "$BASE_URL/locations/$LOCATION_ID/typing" \
+  -H "Authorization: Bearer $INBOX_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-raw "{\"conversationId\":$CONVERSATION_ID,\"agentId\":$AGENT_ID,\"typing\":true}"
+```
+
+`GET /locations/:locationId/presence` — HTTP 200. Agent IDs with an open stream on this server instance:
+
+```sh
+curl -sS "$BASE_URL/locations/$LOCATION_ID/presence" \
+  -H "Authorization: Bearer $INBOX_TOKEN"
 ```
