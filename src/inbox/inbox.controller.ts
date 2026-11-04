@@ -93,6 +93,19 @@ export class InboxController {
     @Res() res: Response,
   ) {
     const locationId = await this.inbox.resolveLocationId(params.locationId);
-    return this.events.open(locationId, last, res);
+    if (query.agentId !== undefined)
+      await this.inbox.assertAgentAtLocation(locationId, query.agentId);
+    return this.events.open(locationId, last, res, query.agentId);
+  }
+
+  @Post('locations/:locationId/typing')
+  @HttpCode(202)
+  typing(@Param() params: LocationParamsDto, @Body() body: TypingDto) {
+    return this.inbox.typing(params.locationId, body);
+  }
+
+  @Get('locations/:locationId/presence')
+  presence(@Param() params: LocationParamsDto) {
+    return this.inbox.presence(params.locationId);
   }
 }
