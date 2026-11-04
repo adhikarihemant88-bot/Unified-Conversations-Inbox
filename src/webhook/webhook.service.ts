@@ -40,7 +40,21 @@ export class WebhookService {
       const locations = manager.getRepository(Location);
       const existing = await messages.findOneBy({ providerMessageId });
       if (existing) {
-        throw new ConflictException('Duplicate providerMessageId');
+        // A provider retry replays the same payload: acknowledge it without
+        // writing anything. A reused ID with different content is a conflict.
+        const existingLocation = await locations.findOneBy({
+          id: existing.locationId,
+        });
+        if (
+          existingLocation?.name !== locationName ||
+          existing.channel !== channel ||
+          existing.from !== from ||
+          existing.to !== to ||
+          existing.body !== body ||
+          existing.sentAt.getTime() !== sentAt.getTime()
+        )
+          throw new ConflictException('Duplicate providerMessageId');
+        return { duplicate: true, message: messageView(existing) };
       }
       let location = await locations.findOneBy({ name: locationName });
       if (!location) {

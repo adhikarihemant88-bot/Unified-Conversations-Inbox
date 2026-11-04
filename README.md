@@ -7,7 +7,7 @@ NestJS + TypeScript + PostgreSQL backend for one conversation per participant pa
 Requirements: Node.js 22.15+ (Node 24.9+ to run the Jest suites, which load ESM-only NestJS packages) and PostgreSQL 17+ (or Docker Compose). PostgreSQL is the only service required; Redis is not used.
 
 ```sh
-npm ci
+npm i
 cp .env.example .env.local
 docker compose up -d --wait db
 npm run db:migrate
