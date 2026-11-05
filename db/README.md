@@ -20,11 +20,10 @@ project [README](../README.md) for database setup.
 | `provider_states` | Records provider status events by provider message ID so delivery-state updates can be tracked independently of message creation. |
 | `send_jobs` | Tracks pending outbound message delivery work, retry attempts, and the next eligible attempt time. |
 | `inbox_events` | Stores location-scoped JSON events for inbox updates and event replay. |
-| `pagination_snapshots` | Stores location-scoped pagination snapshots with an expiration time. |
 
 ## Relationships and invariants
 
-- Contacts, conversations, events, and pagination snapshots are location-scoped.
+- Contacts, conversations and events are location-scoped.
 - A conversation references two distinct contacts in the same location. Their
   IDs are stored in ascending order, and the location/participant pair is unique.
 - Messages reference their conversation and location together, preventing a
@@ -36,4 +35,4 @@ project [README](../README.md) for database setup.
 
 The migration also creates indexes for conversation ordering/filtering, message
 history and full-text body search, contact identity lookup, due send jobs, inbox
-events, and snapshot expiration.
+and inbox events.

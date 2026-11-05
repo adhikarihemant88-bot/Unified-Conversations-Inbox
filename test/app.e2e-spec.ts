@@ -16,7 +16,6 @@ import { Location } from '../src/entities/location.entity';
 import { Message } from '../src/entities/message.entity';
 import { Agent } from '../src/entities/agent.entity';
 import { InboxEvent } from '../src/entities/inbox-event.entity';
-import { PaginationSnapshot } from '../src/entities/pagination-snapshot.entity';
 import { ProviderState } from '../src/entities/provider-state.entity';
 import { SendJob } from '../src/entities/send-job.entity';
 
@@ -125,11 +124,6 @@ describe('Inbox (real PostgreSQL)', () => {
   beforeEach(async () => {
     jest.restoreAllMocks();
     await db.ormTransaction(async (manager) => {
-      await manager
-        .getRepository(PaginationSnapshot)
-        .createQueryBuilder()
-        .delete()
-        .execute();
       await manager
         .getRepository(InboxEvent)
         .createQueryBuilder()
@@ -874,26 +868,32 @@ describe('Inbox (real PostgreSQL)', () => {
     await Promise.all(Array.from({ length: 10 }, () => inbound()));
     expect((await list()).body.data[0].unreadCount).toBe(10);
   });
-  it('message snapshot pages handle timestamp ties and late inserts', async () => {
+  it('message pages are stable keyset pages: no duplicates or skips of rows that existed', async () => {
     const ids: number[] = [];
     for (let n = 0; n < 5; n++)
       ids.push((await inbound()).body.data.message.id);
     const c = (await list()).body.data[0].conversationId;
     let page = (await history(c, '?limit=2')).body.data;
     const seen = [...page.items];
-    await inbound(payload(undefined, { sentAt: '2026-10-20T00:00:00Z' }));
-    await inbound();
+    const late = (
+      await inbound(payload(undefined, { sentAt: '2026-10-20T00:00:00Z' }))
+    ).body.data.message;
+    const newest = (await inbound()).body.data.message;
     while (page.nextCursor) {
       page = (await history(c, `?limit=2&cursor=${page.nextCursor}`)).body.data;
       seen.push(...page.items);
     }
-    const compare = (a: number, b: number) => a - b;
-    expect(seen.map((m) => m.id as number).sort(compare)).toEqual(
-      ids.sort(compare),
-    );
-    expect((await history(c)).body.data.items).toHaveLength(7);
+    const seenIds = seen.map((m) => m.id as number);
+    expect(new Set(seenIds).size).toBe(seenIds.length);
+    // Every row that existed at page one, in order, plus the later arrival.
+    expect(seenIds).toEqual([...ids, newest.id]);
+    // The late, older message sits behind the cursor; it is on a fresh listing.
+    expect(seenIds).not.toContain(late.id);
+    const fresh = (await history(c)).body.data.items;
+    expect(fresh).toHaveLength(7);
+    expect(fresh[0].id).toBe(late.id);
   });
-  it('conversation pages include rows that move ahead of the cursor after updates', async () => {
+  it('conversation pages never repeat a row; a conversation that moves ahead of the cursor shows on a fresh listing', async () => {
     const a = (
       await inbound(
         payload(undefined, {
@@ -904,41 +904,116 @@ describe('Inbox (real PostgreSQL)', () => {
     ).body.data.message;
     const b = (await inbound(payload(undefined, { from: '+919000000002' })))
       .body.data.message;
+    const ids = (r: { body: { data: { conversationId: number }[] } }) =>
+      r.body.data.map((c) => c.conversationId);
     const page = await list('?limit=1');
-    expect(page.body.nextCursor).toMatch(/^\d+:\d+$/);
-    expect(page.body.data[0].conversationId).toBe(a.conversationId);
+    expect(page.body.nextCursor).toEqual(expect.any(String));
+    expect(ids(page)).toEqual([a.conversationId]);
+    // b moves ahead of the cursor; c is brand new and sorts after it.
     await inbound(
       payload(undefined, {
         from: '+919000000002',
         sentAt: '2026-10-29T12:00:00Z',
       }),
     );
-    await inbound(payload(undefined, { from: '+919000000003' }));
+    const c = (await inbound(payload(undefined, { from: '+919000000003' })))
+      .body.data.message;
     const second = await list(`?limit=1&cursor=${page.body.nextCursor}`);
-    expect(
-      second.body.data.map((c: { conversationId: number }) => c.conversationId),
-    ).toEqual([b.conversationId]);
+    expect(ids(second)).toEqual([c.conversationId]);
     expect(second.body.nextCursor).toBeNull();
     expect(second.body.hasMore).toBe(false);
+    expect(ids(await list())).toEqual([
+      b.conversationId,
+      a.conversationId,
+      c.conversationId,
+    ]);
   });
-  it('rejects expired cursors and cursors reused with different filters', async () => {
-    await inbound();
-    await inbound(payload(undefined, { from: '+919000000001' }));
-    const page = await list('?limit=1');
+  it('walks every conversation exactly once when last-message times tie', async () => {
+    const created: number[] = [];
+    for (let n = 1; n <= 5; n++)
+      created.push(
+        (await inbound(payload(undefined, { from: `+91900000000${n}` }))).body
+          .data.message.conversationId,
+      );
+    const seen: number[] = [];
+    let cursor = '';
+    for (;;) {
+      const page = await list(`?limit=2${cursor}`);
+      seen.push(
+        ...page.body.data.map(
+          (c: { conversationId: number }) => c.conversationId,
+        ),
+      );
+      if (!page.body.nextCursor) break;
+      cursor = `&cursor=${page.body.nextCursor}`;
+    }
+    expect(seen).toEqual([...created].reverse());
+  });
+  it('pages search results newest first without duplicates', async () => {
+    const ids: number[] = [];
+    for (let n = 0; n < 5; n++)
+      ids.push(
+        (
+          await inbound(
+            payload(undefined, {
+              body: `offer number ${n}`,
+              sentAt: `2026-10-28T10:0${n}:00Z`,
+            }),
+          )
+        ).body.data.message.id,
+      );
+    const seen: number[] = [];
+    let cursor = '';
+    for (;;) {
+      const result = await request(app.getHttpServer())
+        .get(`/locations/loc_1/messages/search?q=offer&limit=2${cursor}`)
+        .set(auth)
+        .expect(200);
+      seen.push(...result.body.data.items.map((m: { id: number }) => m.id));
+      if (!result.body.data.nextCursor) break;
+      cursor = `&cursor=${result.body.data.nextCursor}`;
+    }
+    expect(seen).toEqual([...ids].reverse());
+  });
+  it('rejects malformed cursors with HTTP 400', async () => {
+    const m = (await inbound()).body.data.message;
+    const paths = [
+      '/locations/loc_1/conversations?limit=1',
+      `/conversations/${m.conversationId}/messages?limit=1`,
+      '/locations/loc_1/messages/search?q=Hello&limit=1',
+    ];
+    const encode = (value: string) => Buffer.from(value).toString('base64url');
+    const malformed = [
+      'bad',
+      'not*base64',
+      '12:2', // the old snapshot cursor format
+      encode('2026-02-30T00:00:00.000Z|1'), // impossible calendar date
+      encode('2026-10-28T10:15:00.000Z|99999999999'), // id out of range
+      encode('2026-10-28T10:15:00Z|1'), // not the canonical timestamp form
+    ];
+    for (const path of paths)
+      for (const cursor of malformed)
+        await request(app.getHttpServer())
+          .get(`${path}&cursor=${cursor}`)
+          .set(auth)
+          .expect(400);
+    // A null-time cursor is only meaningful for conversations (no message yet).
+    const nullTime = encode('-|1');
     await request(app.getHttpServer())
-      .get(
-        `/locations/loc_1/conversations?status=open&cursor=${page.body.nextCursor}`,
-      )
+      .get(`${paths[0]}&cursor=${nullTime}`)
       .set(auth)
-      .expect(410);
-    const snapshots = await db.getRepository(PaginationSnapshot).find();
-    for (const snapshot of snapshots)
-      snapshot.expiresAt = new Date(Date.now() - 1000);
-    await db.getRepository(PaginationSnapshot).save(snapshots);
-    await request(app.getHttpServer())
-      .get(`/locations/loc_1/conversations?cursor=${page.body.nextCursor}`)
-      .set(auth)
-      .expect(410);
+      .expect(200);
+    for (const path of paths.slice(1))
+      await request(app.getHttpServer())
+        .get(`${path}&cursor=${nullTime}`)
+        .set(auth)
+        .expect(400);
+  });
+  it('keeps no pagination state in the database', async () => {
+    const [{ t }] = (await schemaDataSource.query(
+      "select to_regclass('pagination_snapshots') as t",
+    )) as { t: string | null }[];
+    expect(t).toBeNull();
   });
   it('queues outbound, claims once under parallel workers, and preserves unread', async () => {
     const m = (await inbound()).body.data.message;
@@ -1530,13 +1605,9 @@ describe('Inbox (real PostgreSQL)', () => {
       expect.any(Number),
     ]);
     expect(contacts[1].id).toBeGreaterThan(contacts[0].id);
-    const snapshot = await db
-      .getRepository(PaginationSnapshot)
-      .findOneByOrFail({ locationId: locOne });
     const event = await db.getRepository(InboxEvent).findOneByOrFail({
       locationId: locOne,
     });
-    expect(Number.isInteger(snapshot.id)).toBe(true);
     expect(Number.isInteger(event.id)).toBe(true);
   });
   it('migration and seed scripts are repeatable against the isolated database schema', async () => {

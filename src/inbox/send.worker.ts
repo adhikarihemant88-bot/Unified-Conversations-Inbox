@@ -4,10 +4,8 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { LessThan } from 'typeorm';
 import { DatabaseService } from '../utils/database.service';
 import { Channels } from './channels';
-import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
 import { SendJob } from '../entities/send-job.entity';
 import { Message } from '../entities/message.entity';
 import { applyStatus, providerLock } from '../webhook/webhook.storage';
@@ -18,7 +16,6 @@ export class SendWorker implements OnModuleInit, OnModuleDestroy {
   private timer?: ReturnType<typeof setTimeout>;
   private stopping = false;
   private active?: Promise<void>;
-  private ticks = 0;
   constructor(
     private readonly db: DatabaseService,
     private readonly channels: Channels,
@@ -44,12 +41,6 @@ export class SendWorker implements OnModuleInit, OnModuleDestroy {
   private async tick() {
     for (let i = 0; i < 20 && !this.stopping; i++)
       if (!(await this.processOne())) break;
-    if (++this.ticks % 240 === 0)
-      await this.db.ormTransaction((manager) =>
-        manager.getRepository(PaginationSnapshot).delete({
-          expiresAt: LessThan(new Date()),
-        }),
-      );
   }
   async processOne(): Promise<boolean> {
     return this.db.ormTransaction(async (manager) => {

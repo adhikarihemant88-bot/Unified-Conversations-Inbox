@@ -136,7 +136,26 @@ curl -sS --get "$BASE_URL/locations/$LOCATION_ID/conversations" \
   --data-urlencode "cursor=$CONVERSATIONS_CURSOR"
 ```
 
-Keep the same filters across pages. Stop when `nextCursor` is null. Snapshot cursors expire after 15 minutes; expired or mismatched cursors return HTTP 410.
+Keep the same filters across pages. Stop when `nextCursor` is null. Cursors are stateless and never expire; a malformed cursor returns HTTP 400.
+
+A cursor is an opaque token (the encoded sort key of the last row returned): copy it exactly as received. To walk every page automatically (requires `jq`; `limit=2` here only so that a small inbox has several pages):
+
+```sh
+CURSOR=''
+while :; do
+  CURSOR_ARGS=()
+  [ -n "$CURSOR" ] && CURSOR_ARGS=(--data-urlencode "cursor=$CURSOR")
+  RESPONSE=$(curl -sS --get "$BASE_URL/locations/$LOCATION_ID/conversations" \
+    -H "Authorization: Bearer $INBOX_TOKEN" \
+    --data-urlencode 'limit=2' \
+    "${CURSOR_ARGS[@]}")
+  echo "$RESPONSE" | jq -c '{ids: [.data[].conversationId], hasMore}'
+  CURSOR=$(echo "$RESPONSE" | jq -r '.nextCursor // empty')
+  [ -z "$CURSOR" ] && break
+done
+```
+
+The first request must not send an empty `cursor=` (HTTP 400), which is why the loop only adds the parameter once it has a cursor. The same loop works for messages and search by changing the URL and reading `.data.nextCursor` and `.data.items[].id`.
 
 ## 5. Get messages in a conversation
 
@@ -287,7 +306,7 @@ curl -sS --get "$BASE_URL/locations/$LOCATION_ID/messages/search" \
   --data-urlencode "cursor=$SEARCH_CURSOR"
 ```
 
-Keep the same `q` when continuing a search snapshot.
+Keep the same `q` when continuing a search.
 
 ## 11. Subscribe to real-time events
 

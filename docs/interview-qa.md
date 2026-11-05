@@ -23,10 +23,10 @@ Prepared from the README, `AI_USAGE.md` and the source. Answers are written in f
 ## 1. Overview and design
 
 **Q1. Give me a 60-second summary of what you built.**
-It is a NestJS, TypeScript and PostgreSQL backend for a unified inbox. A conversation is one per participant pair per location. It is shared across SMS, WhatsApp and email, and messages in either direction land in it. It has an inbound webhook, a status-callback webhook, an outbound send queue with a retrying worker, snapshot-based pagination, SSE for real-time updates with replay, full-text search, and typing and presence as bonuses. Providers are mocked. The main focus is correctness under concurrency: idempotent inbound messages, monotonic delivery status, no lost unread counters and location isolation.
+It is a NestJS, TypeScript and PostgreSQL backend for a unified inbox. A conversation is one per participant pair per location. It is shared across SMS, WhatsApp and email, and messages in either direction land in it. It has an inbound webhook, a status-callback webhook, an outbound send queue with a retrying worker, cursor-based (keyset) pagination, SSE for real-time updates with replay, full-text search, and typing and presence as bonuses. Providers are mocked. The main focus is correctness under concurrency: idempotent inbound messages, monotonic delivery status, no lost unread counters and location isolation.
 
 **Q2. Why NestJS + Postgres, and why no Redis?**
-Nest gives me modules, DI, DTO validation pipes, guards and interceptors, which suit a layered API. Postgres gives me transactions, row locks, unique constraints, `FOR UPDATE SKIP LOCKED` and GIN full-text search, and those covered every concurrency problem in the brief. Using the database for the queue, event log and snapshots means one service to run, and writes commit atomically with their events and jobs. Redis would add a second system and a dual-write problem. I'd bring in a broker only at much higher scale (see section 11).
+Nest gives me modules, DI, DTO validation pipes, guards and interceptors, which suit a layered API. Postgres gives me transactions, row locks, unique constraints, `FOR UPDATE SKIP LOCKED` and GIN full-text search, and those covered every concurrency problem in the brief. Using the database for the queue and event log means one service to run, and writes commit atomically with their events and jobs. Redis would add a second system and a dual-write problem. I'd bring in a broker only at much higher scale (see section 11).
 
 **Q3. How is the code organized?**
 - `src/webhook/`: inbound and status webhooks, plus storage helpers for provider locks and status.
@@ -63,7 +63,6 @@ I documented each one in the README.
 - `provider_states`: per-provider-ID status and lock row.
 - `send_jobs`: attempts, state and next-retry time.
 - `inbox_events`: the transactional event log.
-- `pagination_snapshots`: frozen ordered results, expiring after 15 minutes.
 
 **Q7. How do you make a conversation the same for A→B and B→A?**
 I sort the two contact IDs numerically and store them as `participant_a_id` and `participant_b_id`. The unique key is `(location, a, b)`, so both directions resolve to the same row. Channel is not part of the key, so SMS, WhatsApp and email all share the conversation. Direction lives on each message, so the A/B order never determines who sent what.
@@ -81,7 +80,6 @@ I use composite foreign keys that include `location_id`. A message's `(location_
 - Chronological message history by conversation.
 - Due pending send jobs, for the worker.
 - `(location, event id)` for replay.
-- Snapshot expiry, for the purge job.
 - GIN on the message body's `tsvector`, for search.
 
 **Q11. How do you normalize phone numbers and emails?**
@@ -186,19 +184,19 @@ Yes. A client retry can create two queued messages. The fix is an idempotency ke
 
 ## 6. Pagination
 
-**Q34. Why snapshot pagination instead of offset or keyset?**
-- *Offset* skips or duplicates rows when data changes.
-- *Keyset* works for messages, which order by `(sent_at, id)`. It breaks for conversations, because a new message moves an existing conversation to the top, ahead of the cursor, so the client could skip or see it twice.
-- *Snapshots* freeze the ordered result on the first request, and later pages read from that frozen list. That gives no skips and no duplicates, even with inserts, reordering and late messages.
+**Q34. Why keyset (cursor) pagination instead of offset or snapshots?**
+- *Offset* skips or duplicates rows when data changes, and gets slower with every page.
+- *Snapshots* freeze the ordered result on the first request. They give exact paging, but store a copy of the whole result per listing, need an expiry job, and the first request costs as much as the whole inbox or history.
+- *Keyset* asks for the rows after the last one seen, using an index that matches the sort. Every page costs the same, nothing is stored, and cursors never expire.
 
 **Q35. How does the cursor work?**
-It encodes the snapshot ID and the next position. The snapshot is bound to the location, the resource and the filters, so a cursor can't be reused across them. The first request materializes the ordered IDs in one statement. Page size is 1–100, default 25.
+It is an opaque, stateless token holding the sort key of the last row returned: `(last_message_at, id)` for conversations and `(sent_at, id)` for messages and search. The next page asks for rows strictly after that position and fetches one extra row to learn whether there is more. Page size is 1–100, default 25. A malformed cursor returns 400.
 
-**Q36. What if the cursor expires?**
-Snapshots live 15 minutes. After that, the API returns **410 Gone** and the client restarts the listing. The worker purges expired snapshots about once a minute when idle.
+**Q36. What if the client keeps an old cursor?**
+It still works, because the cursor is just a position, not a server-side session. There is nothing to expire and no purge job.
 
 **Q37. What is the downside?**
-Snapshot creation stores the whole result, so cost scales with inbox or history size. Data inside a snapshot is also frozen, so statuses and counters can be stale until a fresh listing. SSE covers live changes. For large histories I'd use bounded or versioned pagination sessions, a cache, and quotas.
+Messages and search are fully stable. For conversations, which sort by latest activity, a conversation that receives a new message moves to the top, ahead of the cursor, so it is not part of the pass already in progress. It never repeats, and it shows on the next fresh listing and over SSE. Pages are also live, so statuses and counters reflect when each page is read. If strict freezing were required I would bring back stored snapshots for small inboxes only. For scale I'd add read replicas, cache the hot first page, and denormalise the latest channel and customer contact onto `conversations`.
 
 ---
 
@@ -261,7 +259,7 @@ Class-based DTOs with `class-validator`, plus a global `ValidationPipe` register
 My first `timestamp()` used a loose ISO regex plus `Date.parse`. JavaScript silently normalizes impossible dates, so `2026-02-30` became March 2, which would corrupt message order and previews. I wrote a failing test first (`expect(...).toThrow()` failed), then rewrote the function to validate year, month, day, leap years, clock values and offsets before converting to UTC. It also rejects `24:00:00`.
 
 **Q53. What does the error contract look like?**
-Success is `{ status, message: "Success", data }`. Errors are 400 for validation, 401 for unauthorized, 403 for the wrong location, 404 for an unknown location or conversation, 409 for a conflicting provider ID, 410 for an expired cursor, and a generic 500 with details only in server logs.
+Success is `{ status, message: "Success", data }`. Errors are 400 for validation (including malformed cursors), 401 for unauthorized, 403 for the wrong location, 404 for an unknown location or conversation, 409 for a conflicting provider ID, and a generic 500 with details only in server logs.
 
 **Q54. PATCH semantics?**
 Omitted fields keep their values. `assignedTo: null` unassigns. An empty body or `status: null` is rejected with 400.
@@ -277,7 +275,7 @@ Integration tests use a real, disposable PostgreSQL (`embedded-postgres`, or `TE
 - Participant-pair and location separation.
 - Early, reordered and terminal statuses.
 - Read versus ingest races.
-- Snapshots under inserts.
+- Keyset pages under inserts.
 - Parallel worker claims, backoff and exhaustion.
 - Transaction rollback.
 - Database-level tenant constraints.
@@ -303,10 +301,10 @@ Be ready to name gaps: long soak or load tests, real provider behaviour, crash r
 Stop polling the DB per connection. Use outbox or event-log consumers feeding a broker partitioned by location, with dedicated SSE gateways that authenticate and fan out. Keep durable event IDs for replay and monitor lag and backpressure.
 
 **Q60. And outbound and pagination?**
-Outbound: leased jobs, with provider calls outside transactions and provider-side idempotency. Pagination: replace full-result snapshots with bounded or versioned sessions, plus cached inbox projections.
+Outbound: leased jobs, with provider calls outside transactions and provider-side idempotency. Pagination: keep keyset cursors, add read replicas and a cached first page.
 
 **Q61. What would break first today?**
-Per-connection 500ms polling of the event table, snapshot creation on very large inboxes, and location-row lock contention on a very hot location.
+Per-connection 500ms polling of the event table, and location-row lock contention on a very hot location.
 
 ---
 
@@ -315,7 +313,7 @@ Per-connection 500ms polling of the event table, snapshot creation on very large
 **Q62. Biggest trade-offs you made?**
 - Locks over lock-free designs: correctness first, at the cost of throughput on hot rows.
 - Postgres-only: simpler operations, but polling instead of push.
-- Snapshots: exact paging, but storage cost.
+- Keyset cursors: stateless and cheap, but a conversation that moves to the top mid-pagination shows on the next fresh listing.
 - Static tokens: testable, but not production auth.
 
 **Q63. What would you do next with another week?**

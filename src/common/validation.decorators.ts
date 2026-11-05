@@ -1,5 +1,6 @@
 import { applyDecorators } from '@nestjs/common';
 import { IsString, Matches, ValidateBy } from 'class-validator';
+import { decodeCursor } from '../inbox/cursor';
 import { timestamp } from '../inbox/domain';
 
 export function NonBlankString() {
@@ -29,21 +30,12 @@ export function IsStrictTimestamp() {
   });
 }
 
-export function IsSnapshotCursor() {
+export function IsKeysetCursor() {
   return ValidateBy({
-    name: 'isSnapshotCursor',
+    name: 'isKeysetCursor',
     validator: {
-      validate(value: unknown) {
-        if (typeof value !== 'string') return false;
-        const match = /^(\d+):(\d+)$/.exec(value);
-        return (
-          match !== null &&
-          Number.isSafeInteger(Number(match[1])) &&
-          Number(match[1]) <= 2147483647 &&
-          Number.isSafeInteger(Number(match[2]))
-        );
-      },
-      defaultMessage: () => '$property must be a valid snapshot cursor',
+      validate: (value: unknown) => decodeCursor(value) !== null,
+      defaultMessage: () => '$property must be a valid pagination cursor',
     },
   });
 }

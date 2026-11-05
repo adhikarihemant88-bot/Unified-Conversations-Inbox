@@ -13,7 +13,6 @@ import { Conversation } from '../entities/conversation.entity';
 import { InboxEvent } from '../entities/inbox-event.entity';
 import { Location } from '../entities/location.entity';
 import { Message } from '../entities/message.entity';
-import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
 import { ProviderState } from '../entities/provider-state.entity';
 import { SendJob } from '../entities/send-job.entity';
 import { databaseUrl } from './database-url';
@@ -37,7 +36,6 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         InboxEvent,
         Location,
         Message,
-        PaginationSnapshot,
         ProviderState,
         SendJob,
       ],

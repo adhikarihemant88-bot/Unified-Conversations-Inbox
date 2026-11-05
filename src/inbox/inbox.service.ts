@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  GoneException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -10,10 +9,10 @@ import { ContactIdentity } from '../entities/contact-identity.entity';
 import { Conversation as ConversationEntity } from '../entities/conversation.entity';
 import { Location } from '../entities/location.entity';
 import { Message } from '../entities/message.entity';
-import { PaginationSnapshot } from '../entities/pagination-snapshot.entity';
 import { SendJob } from '../entities/send-job.entity';
 import { DatabaseService } from '../utils/database.service';
 import { Channels } from './channels';
+import { decodeCursor, encodeCursor, type CursorPosition } from './cursor';
 import { EventsService } from './events.service';
 import type { TypingDto } from './dto/typing.dto';
 import type { SendMessageDto } from './dto/send-message.dto';
@@ -226,6 +225,7 @@ export class InboxService {
 
   async listConversations(locationName: string, query: ConversationQueryDto) {
     const location = await this.resolveLocationId(locationName);
+    const position = this.cursorPosition(query.cursor);
     return this.db.ormTransaction(async (manager) => {
       const conversations = manager
         .getRepository(ConversationEntity)
@@ -241,104 +241,35 @@ export class InboxService {
         conversations.andWhere('conversation.assignedTo = :assignedTo', {
           assignedTo: query.assignedTo,
         });
-      conversations
+      // Rows strictly after the cursor in (lastMessageAt DESC NULLS LAST, id DESC).
+      if (position?.at)
+        conversations.andWhere(
+          '(conversation.lastMessageAt < :at OR (conversation.lastMessageAt = :at AND conversation.id < :cursorId) OR conversation.lastMessageAt IS NULL)',
+          { at: position.at, cursorId: position.id },
+        );
+      else if (position)
+        conversations.andWhere(
+          'conversation.lastMessageAt IS NULL AND conversation.id < :cursorId',
+          { cursorId: position.id },
+        );
+      const rows = await conversations
         .orderBy('conversation.lastMessageAt', 'DESC', 'NULLS LAST')
-        .addOrderBy('conversation.id', 'DESC');
-
-      return this.snapshot(
-        manager,
-        location,
-        JSON.stringify([
-          'conversations',
-          query.status ?? null,
-          query.assignedTo ?? null,
-        ]),
-        query,
-        async () => {
-          const rows = await conversations.getMany();
-          const identities = await manager
-            .getRepository(ContactIdentity)
-            .findBy({ locationId: location });
-          const latestInboundMessages = await manager
-            .getRepository(Message)
-            .createQueryBuilder('message')
-            .distinctOn(['message.conversationId'])
-            .select([
-              'message.conversationId',
-              'message.channel',
-              'message.from',
-              'message.sentAt',
-              'message.id',
-            ])
-            .where('message.locationId = :locationId', {
-              locationId: location,
-            })
-            .andWhere('message.direction = :direction', {
-              direction: 'inbound',
-            })
-            .orderBy('message.conversationId', 'ASC')
-            .addOrderBy('message.sentAt', 'DESC')
-            .addOrderBy('message.id', 'DESC')
-            .getMany();
-          const lastMessageIds = rows.flatMap((conversation) =>
-            conversation.lastMessageId === null
-              ? []
-              : [conversation.lastMessageId],
-          );
-          const lastMessages = lastMessageIds.length
-            ? await manager.getRepository(Message).find({
-                where: { id: In(lastMessageIds) },
-                select: { id: true, channel: true },
-              })
-            : [];
-          const lastMessageChannels = new Map(
-            lastMessages.map((message) => [message.id, message.channel]),
-          );
-          const customerContactByConversation = new Map<number, number>();
-          const identityByKindAndValue = new Map(
-            identities.map((identity) => [
-              JSON.stringify([identity.kind, identity.value]),
-              identity.contactId,
-            ]),
-          );
-          for (const message of latestInboundMessages) {
-            const kind =
-              this.channels.get(message.channel).kind === 'email'
-                ? 'email'
-                : 'phone';
-            const customer = identityByKindAndValue.get(
-              JSON.stringify([kind, message.from]),
-            );
-            if (customer !== undefined)
-              customerContactByConversation.set(
-                message.conversationId,
-                customer,
-              );
-          }
-          return rows.map((conversation) => {
-            const contactId =
-              customerContactByConversation.get(conversation.id) ??
-              conversation.participantAId;
-            return {
-              conversationId: conversation.id,
-              contactId,
-              lastMessageChannel:
-                conversation.lastMessageId === null
-                  ? null
-                  : (lastMessageChannels.get(conversation.lastMessageId) ??
-                    null),
-              lastMessagePreview: conversation.lastMessagePreview,
-              lastMessageAt: conversation.lastMessageAt,
-              status: conversation.status,
-              assignedTo: conversation.assignedTo,
-              unreadCount: conversation.unreadCount,
-            };
-          });
-        },
+        .addOrderBy('conversation.id', 'DESC')
+        .limit(query.limit + 1)
+        .getMany();
+      const page = this.paginate(rows, query.limit, (conversation) =>
+        encodeCursor(conversation.lastMessageAt, conversation.id),
       );
+      return {
+        items: await this.conversationSummaries(manager, location, page.items),
+        nextCursor: page.nextCursor,
+        hasMore: page.hasMore,
+      };
     }, 'REPEATABLE READ');
   }
+
   async listMessages(id: number, query: PaginationDto) {
+    const position = this.cursorPosition(query.cursor, true);
     return this.db.ormTransaction(async (manager) => {
       const conversation = await manager
         .getRepository(ConversationEntity)
@@ -350,121 +281,189 @@ export class InboxService {
       const messages = manager
         .getRepository(Message)
         .createQueryBuilder('message')
-        .select([
-          'message.id',
-          'message.conversationId',
-          'message.providerMessageId',
-          'message.channel',
-          'message.direction',
-          'message.from',
-          'message.to',
-          'message.body',
-          'message.status',
-          'message.sentAt',
-          'message.createdAt',
-        ])
+        .select(messageColumnsToSelect)
         .where('message.locationId = :locationId', {
           locationId: conversation.locationId,
         })
         .andWhere('message.conversationId = :conversationId', {
           conversationId: id,
-        })
+        });
+      // Chronological: rows strictly after the cursor in (sentAt ASC, id ASC).
+      if (position)
+        messages.andWhere(
+          '(message.sentAt > :at OR (message.sentAt = :at AND message.id > :cursorId))',
+          { at: position.at, cursorId: position.id },
+        );
+      const rows = await messages
         .orderBy('message.sentAt', 'ASC')
-        .addOrderBy('message.id', 'ASC');
-      return this.snapshot(
-        manager,
-        conversation.locationId,
-        JSON.stringify(['messages', id]),
-        query,
-        async () => messages.getMany().then((rows) => rows.map(messageView)),
+        .addOrderBy('message.id', 'ASC')
+        .limit(query.limit + 1)
+        .getMany();
+      const page = this.paginate(rows, query.limit, (message) =>
+        encodeCursor(message.sentAt, message.id),
       );
-    }, 'REPEATABLE READ');
+      return {
+        items: page.items.map(messageView),
+        nextCursor: page.nextCursor,
+        hasMore: page.hasMore,
+      };
+    });
   }
 
   async search(locationName: string, query: SearchMessagesDto) {
     const location = await this.resolveLocationId(locationName);
     const q = query.q.trim();
-    return this.db.ormTransaction((manager) => {
+    const position = this.cursorPosition(query.cursor, true);
+    return this.db.ormTransaction(async (manager) => {
       const messages = manager
         .getRepository(Message)
         .createQueryBuilder('message')
-        .select([
-          'message.id',
-          'message.conversationId',
-          'message.providerMessageId',
-          'message.channel',
-          'message.direction',
-          'message.from',
-          'message.to',
-          'message.body',
-          'message.status',
-          'message.sentAt',
-          'message.createdAt',
-        ])
+        .select(messageColumnsToSelect)
         .where('message.locationId = :locationId', { locationId: location })
         .andWhere(
           "to_tsvector('simple', message.body) @@ websearch_to_tsquery('simple', :query)",
           { query: q },
-        )
+        );
+      // Newest first: rows strictly after the cursor in (sentAt DESC, id DESC).
+      if (position)
+        messages.andWhere(
+          '(message.sentAt < :at OR (message.sentAt = :at AND message.id < :cursorId))',
+          { at: position.at, cursorId: position.id },
+        );
+      const rows = await messages
         .orderBy('message.sentAt', 'DESC')
-        .addOrderBy('message.id', 'DESC');
-      return this.snapshot(
-        manager,
-        location,
-        JSON.stringify(['search', q]),
-        query,
-        async () => messages.getMany().then((rows) => rows.map(messageView)),
+        .addOrderBy('message.id', 'DESC')
+        .limit(query.limit + 1)
+        .getMany();
+      const page = this.paginate(rows, query.limit, (message) =>
+        encodeCursor(message.sentAt, message.id),
       );
-    }, 'REPEATABLE READ');
+      return {
+        items: page.items.map(messageView),
+        nextCursor: page.nextCursor,
+        hasMore: page.hasMore,
+      };
+    });
   }
 
-  private async snapshot(
-    manager: EntityManager,
-    location: number,
-    scope: string,
-    query: PaginationDto,
-    loadItems: () => Promise<Record<string, unknown>[]>,
-  ) {
-    const limit = query.limit;
-    let id: number;
-    let offset = 0;
-    if (query.cursor !== undefined) {
-      const [snapshotId, position] = query.cursor.split(':');
-      id = Number(snapshotId);
-      offset = Number(position);
-    } else {
-      const items = await loadItems();
-      const snapshot = await manager.getRepository(PaginationSnapshot).save(
-        manager.getRepository(PaginationSnapshot).create({
-          locationId: location,
-          scope,
-          items,
-        }),
-      );
-      id = snapshot.id;
-    }
-    const snapshot = await manager
-      .getRepository(PaginationSnapshot)
-      .createQueryBuilder('snapshot')
-      .where('snapshot.id = :id', { id })
-      .andWhere('snapshot.locationId = :locationId', { locationId: location })
-      .andWhere('snapshot.scope = :scope', { scope })
-      .andWhere('snapshot.expiresAt > clock_timestamp()')
-      .getOne();
-    if (!snapshot)
-      throw new GoneException(
-        'Cursor expired or does not belong to this query',
-      );
-    if (offset > snapshot.items.length)
-      throw new BadRequestException('Invalid cursor offset');
-    const items = snapshot.items.slice(offset, offset + limit);
+  /** Decodes the optional cursor; `requireTime` rejects the null-time form. */
+  private cursorPosition(
+    cursor: string | undefined,
+    requireTime = false,
+  ): CursorPosition | undefined {
+    if (cursor === undefined) return undefined;
+    const position = decodeCursor(cursor);
+    if (!position || (requireTime && position.at === null))
+      throw new BadRequestException('Invalid cursor');
+    return position;
+  }
+
+  /** `rows` holds up to limit + 1 rows; the extra one only proves there is more. */
+  private paginate<T>(
+    rows: T[],
+    limit: number,
+    cursorOf: (row: T) => string,
+  ): { items: T[]; nextCursor: string | null; hasMore: boolean } {
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
     return {
       items,
-      nextCursor:
-        offset + limit < snapshot.items.length
-          ? `${id}:${offset + limit}`
-          : null,
-      hasMore: offset + limit < snapshot.items.length,
+      nextCursor: hasMore ? cursorOf(items[items.length - 1]) : null,
+      hasMore,
     };
   }
+
+  /** Adds the latest channel and customer contact for one page of conversations. */
+  private async conversationSummaries(
+    manager: EntityManager,
+    location: number,
+    rows: ConversationEntity[],
+  ) {
+    if (rows.length === 0) return [];
+    const lastMessageIds = rows.flatMap((conversation) =>
+      conversation.lastMessageId === null ? [] : [conversation.lastMessageId],
+    );
+    const lastMessages = lastMessageIds.length
+      ? await manager.getRepository(Message).find({
+          where: { id: In(lastMessageIds) },
+          select: { id: true, channel: true },
+        })
+      : [];
+    const lastMessageChannels = new Map(
+      lastMessages.map((message) => [message.id, message.channel]),
+    );
+    const latestInboundMessages = await manager
+      .getRepository(Message)
+      .createQueryBuilder('message')
+      .distinctOn(['message.conversationId'])
+      .select([
+        'message.conversationId',
+        'message.channel',
+        'message.from',
+        'message.sentAt',
+        'message.id',
+      ])
+      .where('message.locationId = :locationId', { locationId: location })
+      .andWhere('message.conversationId IN (:...conversationIds)', {
+        conversationIds: rows.map((conversation) => conversation.id),
+      })
+      .andWhere('message.direction = :direction', { direction: 'inbound' })
+      .orderBy('message.conversationId', 'ASC')
+      .addOrderBy('message.sentAt', 'DESC')
+      .addOrderBy('message.id', 'DESC')
+      .getMany();
+    const identityKeys = latestInboundMessages.map((message) => ({
+      locationId: location,
+      kind: this.channels.get(message.channel).kind,
+      value: message.from,
+    }));
+    const identities = identityKeys.length
+      ? await manager
+          .getRepository(ContactIdentity)
+          .find({ where: identityKeys })
+      : [];
+    const identityByKindAndValue = new Map(
+      identities.map((identity) => [
+        JSON.stringify([identity.kind, identity.value]),
+        identity.contactId,
+      ]),
+    );
+    const customerContactByConversation = new Map<number, number>();
+    for (const message of latestInboundMessages) {
+      const customer = identityByKindAndValue.get(
+        JSON.stringify([this.channels.get(message.channel).kind, message.from]),
+      );
+      if (customer !== undefined)
+        customerContactByConversation.set(message.conversationId, customer);
+    }
+    return rows.map((conversation) => ({
+      conversationId: conversation.id,
+      contactId:
+        customerContactByConversation.get(conversation.id) ??
+        conversation.participantAId,
+      lastMessageChannel:
+        conversation.lastMessageId === null
+          ? null
+          : (lastMessageChannels.get(conversation.lastMessageId) ?? null),
+      lastMessagePreview: conversation.lastMessagePreview,
+      lastMessageAt: conversation.lastMessageAt,
+      status: conversation.status,
+      assignedTo: conversation.assignedTo,
+      unreadCount: conversation.unreadCount,
+    }));
+  }
 }
+
+const messageColumnsToSelect = [
+  'message.id',
+  'message.conversationId',
+  'message.providerMessageId',
+  'message.channel',
+  'message.direction',
+  'message.from',
+  'message.to',
+  'message.body',
+  'message.status',
+  'message.sentAt',
+  'message.createdAt',
+];

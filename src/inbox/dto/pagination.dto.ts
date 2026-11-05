@@ -1,7 +1,7 @@
 import { Transform } from 'class-transformer';
 import { IsIn, IsInt, Max, Min, ValidateIf } from 'class-validator';
 import {
-  IsSnapshotCursor,
+  IsKeysetCursor,
   NonBlankString,
 } from '../../common/validation.decorators';
 
@@ -15,7 +15,7 @@ export class PaginationDto {
   limit = 25;
 
   @ValidateIf((_: PaginationDto, value: unknown) => value !== undefined)
-  @IsSnapshotCursor()
+  @IsKeysetCursor()
   cursor?: string;
 }
 

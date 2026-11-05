@@ -1,6 +1,6 @@
 # Unified Conversations Inbox
 
-NestJS + TypeScript + PostgreSQL backend for one conversation per participant pair per location across SMS, WhatsApp and email. Messages in either direction share the same conversation. Includes mocked providers, concurrent webhook deduplication, durable send retries, monotonic delivery statuses, snapshot pagination, location-isolated SSE and full-text search. No real channel accounts are needed.
+NestJS + TypeScript + PostgreSQL backend for one conversation per participant pair per location across SMS, WhatsApp and email. Messages in either direction share the same conversation. Includes mocked providers, concurrent webhook deduplication, durable send retries, monotonic delivery statuses, cursor (keyset) pagination, location-isolated SSE and full-text search. No real channel accounts are needed.
 
 ## Run locally
 
@@ -17,9 +17,9 @@ npm run start:dev
 
 Set distinct random `INBOX_TOKEN`, `WEBHOOK_TOKEN`, and `ADMIN_TOKEN` values in `.env.local`, and optionally `INBOX_LOCATION_TOKENS` for per-location agent credentials. Every protected endpoint uses `Authorization: Bearer <token>`; each API group accepts only its matching environment token. The inbox token authenticates inbox requests, while location is taken from each endpoint's path/body or resolved from its conversation ID. If using an existing PostgreSQL server, set `DATABASE_URL` there and omit the Docker step. Migrations change the database you explicitly configure; use a development database. Existing environment variables take precedence over `.env.local`, which takes precedence over `.env`. Your existing environment files are not modified by this project.
 
-`npm run db:migrate` applies the single `db/001_init.sql` schema transactionally and is safe to repeat. It creates the schema for a fresh database. Existing databases with an earlier schema require a separate data migration before using this version. `npm run db:seed` creates two demo locations with one agent each, plus two participants at `loc_1`: `+919876543210` / `customer@example.com` and `+918000000000` / `inbox@example.com`. Each participant's phone and email identities are linked to their contact.
+`npm run db:migrate` applies the numbered files in `db/` in order, transactionally, and is safe to repeat. `001_init.sql` creates the schema for a fresh database; `002_keyset_pagination.sql` upgrades a database created before cursor pagination (drops the old `pagination_snapshots` table and replaces the conversation indexes). Existing databases with an earlier schema require a separate data migration before using this version. `npm run db:seed` creates two demo locations with one agent each, plus two participants at `loc_1`: `+919876543210` / `customer@example.com` and `+918000000000` / `inbox@example.com`. Each participant's phone and email identities are linked to their contact.
 
-Location, agent, contact, conversation, message, event, and pagination snapshot IDs are generated integers. Each agent belongs to exactly one location and can only be assigned conversations at that location. The webhook's `locationId` value and the location path segment (for example `loc_1`) refer to the unique location name.
+Location, agent, contact, conversation, message and event IDs are generated integers. Each agent belongs to exactly one location and can only be assigned conversations at that location. The webhook's `locationId` value and the location path segment (for example `loc_1`) refer to the unique location name.
 
 The seed command prints generated integer agent IDs; use those values for `assignedTo` and its filters. These are development fixtures. Authentication is handled by separate module bearer tokens in `.env.local`; the webhook token grants trusted provider access to all locations. In a real integration, verify provider signatures and derive location from the registered provider account.
 
@@ -46,7 +46,7 @@ For every endpoint, all three channels, pagination, assignment variants and SSE 
 
 Create an agent with `POST /admin/agents`, using the configured `ADMIN_TOKEN` as a bearer token. Send `{ "name": "Agent name", "locationId": "loc_1" }` (the location name; an unknown location returns HTTP 404); the response includes the generated integer ID, name and location. Agent names are unique case-insensitively after trimming within a location, so the same name may exist at different locations; a duplicate at the same location returns HTTP 409 without creating another agent.
 
-All JSON responses use `{ "status": 200, "message": "Success", "data": ... }`. Validation errors use HTTP 400, unauthorized requests 401, unknown locations or conversations 404, conflicting provider IDs 409, and expired/incompatible pagination cursors 410. Location-scoped endpoints take the location name from the route (or webhook payload); conversation-ID endpoints resolve location from the stored conversation. Unexpected errors return a generic HTTP 500 response; details stay in server logs. SSE uses standard event-stream framing.
+All JSON responses use `{ "status": 200, "message": "Success", "data": ... }`. Validation errors, including malformed pagination cursors, use HTTP 400, unauthorized requests 401, unknown locations or conversations 404, and conflicting provider IDs 409. Location-scoped endpoints take the location name from the route (or webhook payload); conversation-ID endpoints resolve location from the stored conversation. Unexpected errors return a generic HTTP 500 response; details stay in server logs. SSE uses standard event-stream framing.
 
 Request bodies, path parameters and pagination/filter/search queries use class-based [inbox DTOs](./src/inbox/dto/) and [webhook DTOs](./src/webhook/dto/). A global `ValidationPipe` is registered through `APP_PIPE` in [AppModule](./src/app.module.ts), so production and integration tests use identical validation. It transforms DTO instances, rejects unknown fields and validates positive integer IDs, required nonblank strings, enums, calendar timestamps and cursors. Strings have no arbitrary DTO length limits. Query limits explicitly convert decimal strings to integers between 1 and 100; implicit coercion is disabled. On patches, omitted fields preserve existing values, `assignedTo: null` unassigns, and empty updates or `status: null` are rejected. Phone/email normalization, authorization, status progression and transaction invariants stay in services/database constraints.
 
@@ -101,6 +101,24 @@ Filters are optional. Omit both to list all conversations. The response contains
 ```
 
 Each summary includes the latest message channel; participant IDs and full message histories are not returned. Use `data[0].conversationId` as the integer conversation ID for the following requests. It is distinct from `providerMessageId`.
+
+Pagination: pass `limit` (1–100, default 25) and, for the next page, the `nextCursor` from the previous response (`data.nextCursor` for messages and search). Repeat the same filters and stop when `nextCursor` is `null`:
+
+```sh
+# First page: two conversations, newest first.
+curl --get "http://localhost:3000/locations/loc_1/conversations" \
+  -H "Authorization: Bearer $INBOX_TOKEN" \
+  --data-urlencode 'limit=2'
+# ... "nextCursor": "MjAyNi0xMC0yOFQxMDowNTowMC4wMDBafDU", "hasMore": true
+
+# Next page: the same query plus the cursor.
+curl --get "http://localhost:3000/locations/loc_1/conversations" \
+  -H "Authorization: Bearer $INBOX_TOKEN" \
+  --data-urlencode 'limit=2' \
+  --data-urlencode 'cursor=MjAyNi0xMC0yOFQxMDowNTowMC4wMDBafDU'
+```
+
+A cursor is an opaque token (the base64url-encoded sort key of the last row returned): copy it as received, never build or edit one. It is stateless and never expires, and a malformed cursor returns HTTP 400. Use `--get` (or put the parameters in the URL) so curl sends them as a query string; with a plain `GET` and `--data-urlencode` they would go in the request body and be ignored.
 
 ```sh
 # Replace CONVERSATION_ID with a returned integer ID.
@@ -162,7 +180,7 @@ curl 'http://localhost:3000/locations/loc_1/messages/search?q=offer&limit=25' \
   -H "Authorization: Bearer $INBOX_TOKEN"
 ```
 
-Search uses PostgreSQL full-text matching with the `simple` dictionary, newest first. It supports snapshot cursors too. This is token matching, not arbitrary substring/fuzzy search.
+Search uses PostgreSQL full-text matching with the `simple` dictionary, newest first. It uses the same cursors. This is token matching, not arbitrary substring/fuzzy search.
 
 ## Data model and indexes
 
@@ -179,9 +197,8 @@ The schema is defined by the initialization migration in [db/](./db/).
 | `provider_states`      | Status state and per-provider row lock, including callbacks received before message persistence.                                                                                                                                    |
 | `send_jobs`            | Persistent attempts, pending/done state, and retry schedule.                                                                                                                                                                        |
 | `inbox_events`         | Generated integer primary key and transactional event log for location-filtered replay.                                                                                                                                             |
-| `pagination_snapshots` | Generated integer primary key; location/query-scoped ordered result snapshots, expiring after 15 minutes.                                                                                                                           |
 
-Indexes cover conversation listing by location/latest activity, status/assignment filters, contact identity lookup, chronological message history, due pending jobs, location/event ID polling, snapshot expiry, and GIN full-text search. Primary and unique constraints supply the supporting identity/idempotency indexes. Composite foreign keys prevent accidental cross-location references even in direct SQL writes.
+Indexes cover conversation listing by location/latest activity, status/assignment filters, contact identity lookup, chronological message history, due pending jobs, location/event ID polling, and GIN full-text search. Primary and unique constraints supply the supporting identity/idempotency indexes. Composite foreign keys prevent accidental cross-location references even in direct SQL writes.
 
 Phone input must include a country code; spaces, parentheses, dots, hyphens and a `whatsapp:` prefix are normalized. Email is trimmed and lowercased. We do not guess a country code or infer that an unlinked email and phone belong to one person. The demo seed links phone/email identities for both participants; unknown addresses create separate contacts until explicitly linked. A contact management/merge API is outside the assignment scope.
 
@@ -217,11 +234,11 @@ Pending work and attempt counts survive application restarts. The mock runs whil
 
 ### Stable pagination
 
-A cursor contains the generated integer snapshot ID and next position. The first request materializes an ordered result in one database statement. Later requests page through that frozen result; snapshots are bound to location, resource and filters. Page size is 1–100 (default 25). Snapshots expire in 15 minutes; restart listing after HTTP 410.
+A cursor is an opaque, stateless token holding the sort key of the last row returned: `(last_message_at, id)` for conversations and `(sent_at, id)` for messages and search. The next request asks for the rows strictly after that position (`WHERE (key) after cursor ORDER BY key LIMIT n+1`), so every page costs the same however deep it is, nothing is stored on the server, and cursors never expire. Page size is 1–100 (default 25). A malformed cursor returns HTTP 400. The conversation indexes (`conversations_by_activity`, `_by_status_activity`, `_by_assignee_activity`) match the sort order `last_message_at DESC NULLS LAST, id DESC`, so filtered and unfiltered lists are both index-ordered.
 
-Messages use `(sent_at,id)` ordering; conversations use `(last_message_at,id)` descending. A simple live keyset is insufficient for conversations because a new message moves an existing conversation ahead of the cursor. Frozen snapshots prevent both skipped rows and duplicates, including late messages with older timestamps. Messages/events arriving after snapshot creation appear through SSE and a fresh listing; statuses/counters in existing snapshots remain frozen too.
+Messages order by `(sent_at,id)` ascending and search by the same key descending. Both are stable: rows that existed when the first page was read are never repeated or skipped. A message that arrives later appears on later pages if it sorts after the cursor; a late message with an older `sent_at` sits behind the cursor and appears on a fresh listing. Conversations order by `(last_message_at,id)` descending, so a conversation that receives a new message **moves to the top, ahead of the cursor**. It is never repeated, but it is not part of the pass already in progress and shows on the next fresh listing (and over SSE). That is the deliberate trade-off of keyset pagination on a recency-ordered list.
 
-Trade-off: snapshot creation stores the entire result and scales with inbox/history size. Worker housekeeping deletes expired snapshots roughly every minute when idle (less frequently under load). For large histories, use versioned ordering or an external snapshot cache, quotas and explicit pagination sessions.
+Trade-off: pages are live, not frozen, so statuses and counters reflect the moment each page is read, and the conversation-ordering behaviour above applies. A frozen result would require stored snapshots; this design stores nothing and its cost depends on the page size, not the inbox size. For very large inboxes add read replicas and cache the hot first page. The list's latest channel and customer contact are looked up for the returned page only and could be denormalised onto `conversations`.
 
 ### Location-isolated real-time updates
 
@@ -245,7 +262,7 @@ TEST_DATABASE_URL=postgresql://user:password@localhost:5432/inbox_test npm run t
 
 The suite creates a random private schema, runs migrations there, and removes only that schema afterward. Database permissions must permit schema creation. No existing application tables are truncated. If your package manager disables dependency postinstall scripts, enable the platform package's hydration script or use `TEST_DATABASE_URL`.
 
-Coverage includes concurrent duplicates, 50 simultaneous first messages in both directions, participant-pair/location separation, cross-channel identities for both participants, reply direction, early/reordered/terminal statuses, read/reset races, reopening, late-message previews, snapshots under insertion/reordering, outbound parallel claims/backoff/exhaustion/recovery, transaction rollback, database-level tenant constraints, HTTP authorization and live SSE isolation/replay.
+Coverage includes concurrent duplicates, 50 simultaneous first messages in both directions, participant-pair/location separation, cross-channel identities for both participants, reply direction, early/reordered/terminal statuses, read/reset races, reopening, late-message previews, keyset pages under insertion/reordering, outbound parallel claims/backoff/exhaustion/recovery, transaction rollback, database-level tenant constraints, HTTP authorization and live SSE isolation/replay.
 
 ## Trade-offs and improvements
 
@@ -260,6 +277,6 @@ Coverage includes concurrent duplicates, 50 simultaneous first messages in both 
 
 Partition ingestion by location/participant pair to preserve per-conversation ordering while processing unrelated conversations in parallel. Acknowledge only after durable acceptance (database commit or a durable broker). Batch writes, partition large message/event tables, tune indexes and connection pools, and enforce provider deduplication on the durable write path. A single hot conversation still requires serialized counter/order updates; tenant partitioning alone cannot remove that contention.
 
-Replace per-connection database polling with event-log/outbox consumers and a broker partitioned by location. Dedicated SSE gateways authenticate location subscriptions and fan out committed events across instances. Retain durable event IDs for reconnect/replay and monitor lag/backpressure. Leased outbound jobs allow slow network calls outside transactions; provider idempotency handles the send/commit crash window. Replace full-result JSON snapshots with bounded/versioned pagination sessions and cache suitable inbox projections.
+Replace per-connection database polling with event-log/outbox consumers and a broker partitioned by location. Dedicated SSE gateways authenticate location subscriptions and fan out committed events across instances. Retain durable event IDs for reconnect/replay and monitor lag/backpressure. Leased outbound jobs allow slow network calls outside transactions; provider idempotency handles the send/commit crash window. Keep keyset pagination, add read replicas and cache the hot first page of inbox projections.
 
 See [AI_USAGE.md](./AI_USAGE.md) for the AI-assisted workflow and a real regression caught and fixed during implementation.

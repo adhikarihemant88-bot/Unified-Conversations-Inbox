@@ -22,7 +22,7 @@ The correction validates exact timestamp components, leap years, month/day range
 
 Domain tests cover validation and normalization; integration tests run actual PostgreSQL, parallel HTTP requests and SSE streams. They exercise database constraints/locks instead of pretending an in-memory mock proves concurrency. Provider failures and retry recovery are deterministic in tests, while normal application mock sends fail randomly at the configured probability.
 
-Code and README document assumptions that the brief leaves open: explicit phone/email linking, globally unique provider IDs, terminal failures, read/reset ordering, and frozen pagination semantics. The implementation should be reviewed and understood before submission, including the external-send crash window and snapshot storage cost.
+Code and README document assumptions that the brief leaves open: explicit phone/email linking, globally unique provider IDs, terminal failures, read/reset ordering, and keyset pagination semantics. The implementation should be reviewed and understood before submission, including the external-send crash window and the conversation-ordering trade-off of cursor pagination.
 
 ## Limitation: DTO implementation needed manual correction
 
